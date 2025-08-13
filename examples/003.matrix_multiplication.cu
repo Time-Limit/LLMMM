@@ -10,8 +10,10 @@
 #include <stdexcept>
 #include <vector>
 
-#include "util/error.h"
+#include "util/macro.h"
 #include "util/util.cuh"
+
+using namespace LLMMM;
 
 __global__ void naive_mm(const float* A, const float* B, float* C, int M, int N, int K)
 {

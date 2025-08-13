@@ -4,7 +4,7 @@
 #include <cuda_runtime.h>
 #include <random>
 
-#include "util/error.h"
+#include "util/macro.h"
 
 __global__ void dim1_load_float(const float *A, float *B, int N) {
   int index = blockDim.x * blockIdx.x + threadIdx.x;

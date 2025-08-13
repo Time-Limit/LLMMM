@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <vector>
 
-#include "util/error.h"
+#include "util/macro.h"
 
 __global__ void vector_add_base(const float *A, const float *B, float *C,
                                 int N) {

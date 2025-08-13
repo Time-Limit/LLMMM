@@ -1,4 +1,4 @@
-#include "util/error.h"
+#include "util/macro.h"
 
 // The version that uses a float type accumulator and applies Kahan's algorithm
 // to reduce precision loss.

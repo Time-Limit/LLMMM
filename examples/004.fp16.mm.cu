@@ -10,8 +10,10 @@
 #include <type_traits>
 #include <vector>
 
-#include "util/error.h"
+#include "util/macro.h"
 #include "util/util.cuh"
+
+using namespace LLMMM;
 
 const int limit = 128;
 

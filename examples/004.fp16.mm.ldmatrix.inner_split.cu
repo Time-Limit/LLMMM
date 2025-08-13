@@ -11,9 +11,10 @@
 #include <type_traits>
 #include <vector>
 
-#include "util/error.h"
-#include "util/fp16.mm.cuh"
+#include "util/macro.h"
 #include "util/util.cuh"
+
+using namespace LLMMM;
 
 const int limit = 16;
 

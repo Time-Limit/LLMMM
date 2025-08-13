@@ -1,10 +1,12 @@
-#include "util/error.h"
+#include "util/macro.h"
 #include "util/util.cuh"
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+
+using namespace LLMMM;
 
 __global__ void test_ld_global_and_st_shared(const float* dram, size_t size)
 {

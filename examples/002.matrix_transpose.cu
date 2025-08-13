@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <vector>
 
-#include "util/error.h"
+#include "util/macro.h"
 #include "util/util.cuh"
 
 __global__ void matrix_transpose_base(const float *input, float *output,

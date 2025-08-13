@@ -4,88 +4,44 @@
 #include <cstdio>
 #include <cuda_fp16.h>
 
-template <typename T> __device__ void swap(T &a, T &b) {
-  T tmp = a;
-  a = b;
-  b = tmp;
-}
+namespace LLMMM {
 
-__device__ __inline__ bool this_block_can_log() {
+__device__ __inline__ bool this_block_can_log()
+{
   return blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0;
 }
 
-__device__ __inline__ bool this_thread_can_log(int thread_x = -1) {
+__device__ __inline__ bool this_thread_can_log(int thread_x = -1)
+{
   if (thread_x == -1) {
-    return blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 &&
-           threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0;
+    return blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0 && threadIdx.y == 0
+           && threadIdx.z == 0;
   }
-  return blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 &&
-         threadIdx.x == thread_x && threadIdx.y == 0 && threadIdx.z == 0;
+  return blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == thread_x && threadIdx.y == 0
+         && threadIdx.z == 0;
 }
 
-__device__ __inline__ void print_thread_info(const char *prefix) {
-  printf("%s, block = %03d, %03d, %03d, thread = %03d %03d %03d\n", prefix,
-         blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y,
+__device__ __inline__ void print_thread_info(const char* prefix)
+{
+  printf("%s, block = %03d, %03d, %03d, thread = %03d %03d %03d\n",
+         prefix,
+         blockIdx.x,
+         blockIdx.y,
+         blockIdx.z,
+         threadIdx.x,
+         threadIdx.y,
          threadIdx.z);
 }
 
-#define OFFSET(row, col, stride) ((row) * (stride) + (col))
-
-#define FETCH_FLOAT(dst, src) *(float *)(&(dst)) = *(const float *)(&(src))
-
-#define FETCH_FLOAT2(dst, src) *(float2 *)(&(dst)) = *(const float2 *)(&(src))
-
-#define FETCH_FLOAT4(dst, src) *(float4 *)(&(dst)) = *(const float4 *)(&(src))
-
-#define FETCH_FLOAT4_WITH_PTR(dst, src) *(float4*)(dst) = *(const float4*)(src)
-
-#define FETCH_FLOAT4_PREFETCH_256B_WITH_SRC_PTR(dst, src)                                                              \
-  {                                                                                                                    \
-    asm volatile("ld.global.L2::256B.v4.f32 {%0, %1, %2, %3}, [%4];"                                   \
-                 : "=f"(dst[0]), "=f"(dst[1]), "=f"(dst[2]), "=f"(dst[3])                                              \
-                 : "l"((const float*)(src)));                                                                          \
-  }
-
-#define FETCH_FLOAT4_EVICT_LAST_AND_PREFETCH_256B_WITH_SRC_PTR(dst, src)                                               \
-  {                                                                                                                    \
-    asm volatile("ld.global.L1::evict_last.L2::256B.v4.f32 {%0, %1, %2, %3}, [%4];"                                    \
-                 : "=f"(dst[0]), "=f"(dst[1]), "=f"(dst[2]), "=f"(dst[3])                                              \
-                 : "l"((const float*)(src)));                                                                          \
-  }
-
-#define FETCH_FLOAT4_CONST_PREFETCH_256B_WITH_SRC_PTR(dst, src)                                                        \
-  {                                                                                                                    \
-    asm volatile("ld.global.nc.L2::128B.v4.f32 {%0, %1, %2, %3}, [%4];"                                                \
-                 : "=f"(dst[0]), "=f"(dst[1]), "=f"(dst[2]), "=f"(dst[3])                                              \
-                 : "l"((const float*)(src)));                                                                          \
-  }
-
-#define FETCH_FLOAT4_CONST_EVICT_LAST_WITH_SRC_PTR(dst, src)                                                           \
-  {                                                                                                                    \
-    asm volatile("ld.global.nc.L1::evict_last.v4.f32 {%0, %1, %2, %3}, [%4];"                                          \
-                 : "=f"(dst[0]), "=f"(dst[1]), "=f"(dst[2]), "=f"(dst[3])                                              \
-                 : "l"((const float*)(src)));                                                                          \
-  }
-
-#define STORE_FLOAT(dst, src) *(float *)(&(dst)) = *(const float *)(&(src))
-
-#define STORE_FLOAT_WITH_PTR(dst, src) *(float*)((dst)) = *(const float*)((src))
-
-#define STORE_FLOAT2(dst, src) *(float2 *)(&(dst)) = *(const float2 *)(&(src))
-
-#define STORE_FLOAT4(dst, src) *(float4 *)(&(dst)) = *(const float4 *)(&(src))
-
-#define STORE_FLOAT4_WITH_PTR(dst, src) *(float4*)(dst) = *(const float4*)(src)
-
-template <int BLOCK_TILE_M, int BLOCK_TILE_N, int THREAD_TILE_M,
-          int THREAD_TILE_N>
-__device__ __inline__ constexpr int device_thread_count_calculator() {
+template<int BLOCK_TILE_M, int BLOCK_TILE_N, int THREAD_TILE_M, int THREAD_TILE_N>
+__device__ __inline__ constexpr int device_thread_count_calculator()
+{
   thread_count_calculator();
 }
 
-template <int UNALIGNED_BLOCK_TILE_M>
-__device__ __inline__ constexpr int
-device_corresponding_aligned_M_calculator() {
+template<int UNALIGNED_BLOCK_TILE_M>
+__device__ __inline__ constexpr int device_corresponding_aligned_M_calculator()
+{
   corresponding_aligned_M_calculator();
 }
 
@@ -114,7 +70,8 @@ mma_sync_aligned_m8n8k4_row_row_f32_f16_f16_f32(float (&D)[8], const T (&A)[4], 
 }
 
 template<typename T>
-__inline__ __device__ void mma_m16n8k16_row_col(float (&d)[4], const T (&a)[8], const T (&b)[4], const float (&c)[4])
+__forceinline__ __device__ void
+mma_m16n8k16_row_col(float (&d)[4], const T (&a)[8], const T (&b)[4], const float (&c)[4])
 {
   uint32_t const* A = reinterpret_cast<uint32_t const*>(&a);
   uint32_t const* B = reinterpret_cast<uint32_t const*>(&b);
@@ -152,3 +109,33 @@ __forceinline__ uint32_t get_sm_number()
   asm volatile("mov.u32 %0, %%nsmid;" : "=r"(sm_number));
   return sm_number;
 }
+
+template<typename T, typename = std::enable_if_t<sizeof(T) == 2>>
+__forceinline__ __device__ void shfl_23_and_01(T (&data)[4], uint32_t mask, int lane_id)
+{
+  uint32_t& _01  = *(uint32_t*)(&data[0]);
+  uint32_t& _23  = *(uint32_t*)(&data[2]);
+  uint32_t  swap = (_01 ^ _23) * (!(lane_id & mask));
+  _01 ^= swap;
+  _23 ^= swap;
+  _01  = __shfl_xor_sync(0xffffffff, _01, mask);
+  swap = (_01 ^ _23) * (!(lane_id & mask));
+  _01 ^= swap;
+  _23 ^= swap;
+}
+
+template<typename T, typename = std::enable_if_t<sizeof(T) == 2>>
+__forceinline__ __device__ void shfl_4567_and_0123(T (&data)[8], uint32_t mask, int lane_id)
+{
+  uint64_t& _0123 = *(uint64_t*)(&data[0]);
+  uint64_t& _4567 = *(uint64_t*)(&data[4]);
+  uint64_t  swap  = (_0123 ^ _4567) * (!(lane_id & mask));
+  _0123 ^= swap;
+  _4567 ^= swap;
+  _0123 = __shfl_xor_sync(0xffffffff, _0123, mask);
+  swap  = (_0123 ^ _4567) * (!(lane_id & mask));
+  _0123 ^= swap;
+  _4567 ^= swap;
+}
+
+}  // namespace LLMMM
