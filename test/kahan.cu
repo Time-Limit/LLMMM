@@ -36,7 +36,7 @@ void launch_kahan(const float* A, const float* B, float* C, int M, int N, int K)
   CHECK_CUDA_ERROR();
 }
 
-__global__ void fp32_mm(const float* A, const float* B, float* C, int M, int N, int K)
+__global__ void fp32_naive_mm(const float* A, const float* B, float* C, int M, int N, int K)
 {
   int n = blockIdx.x * blockDim.x + threadIdx.x;
   int m = blockIdx.y * blockDim.y + threadIdx.y;
@@ -55,13 +55,13 @@ __global__ void fp32_mm(const float* A, const float* B, float* C, int M, int N, 
   C[m * N + n] = sum;
 }
 
-void launch_fp32_mm(const float* A, const float* B, float* C, int M, int N, int K)
+void launch_fp32_naive_mm(const float* A, const float* B, float* C, int M, int N, int K)
 {
   dim3 threads_per_block(16, 16);
   dim3 blocks_per_grid((N + threads_per_block.x - 1) / threads_per_block.x,
                        (M + threads_per_block.y - 1) / threads_per_block.y);
 
-  fp32_mm<<<blocks_per_grid, threads_per_block>>>(A, B, C, M, N, K);
+  fp32_naive_mm<<<blocks_per_grid, threads_per_block>>>(A, B, C, M, N, K);
   CHECK_CUDA_ERROR();
 }
 

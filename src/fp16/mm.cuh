@@ -1,44 +1,38 @@
 #pragma once
 
-#include "fp16/impl.h"
 #include "util/macro.h"
 #include "util/util.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include <stdexcept>
 
 namespace LLMMM {
 
-template<typename T, int BLOCK_TILE_M, int BLOCK_TILE_N, int WARP_TILE_M, int WARP_TILE_N>
-__device__ void
-device_entry(const T* A, const T* B, T* C, int M, int N, int K, T* A_sm, T* B_sm, int m_offset, int n_offset)
+template<typename T, int BLOCK_M, int BLOCK_N, int WARP_M, int WARP_N>
+__device__ void fp16_mm_splited(const T* A, const T* B, T* C, int M, int N, int K, int m_offset, int n_offset)
 {
-  // if(threadIdx.x == 0) {
-  //   printf("%03d %03d %03d\n", blockIdx.x, blockIdx.y, get_smid());
-  // }
-  constexpr int WARP_COUNT   = BLOCK_TILE_M / WARP_TILE_M * BLOCK_TILE_N / WARP_TILE_N;
+  constexpr int WARP_COUNT   = BLOCK_M / WARP_M * BLOCK_N / WARP_N;
   constexpr int THREAD_COUNT = WARP_COUNT * 32;
 
-  constexpr int LOOP_TILE_K         = 16;
+  constexpr int LOOP_K              = 16;
   constexpr int LDG_SM_BUFFER_SIZE  = 4;
   constexpr int LDG_REG_BUFFER_SIZE = 2;
 
   constexpr int A_sm_dim0 = LDG_SM_BUFFER_SIZE;
   constexpr int A_sm_dim1 = 2;
-  constexpr int A_sm_dim2 = BLOCK_TILE_M;
-  constexpr int A_sm_dim3 = LOOP_TILE_K / 2;
+  constexpr int A_sm_dim2 = BLOCK_M;
+  constexpr int A_sm_dim3 = LOOP_K / 2;
   constexpr int B_sm_dim0 = LDG_SM_BUFFER_SIZE;
-  constexpr int B_sm_dim1 = LOOP_TILE_K / 8;
-  constexpr int B_sm_dim2 = BLOCK_TILE_N / 8;
+  constexpr int B_sm_dim1 = LOOP_K / 8;
+  constexpr int B_sm_dim2 = BLOCK_N / 8;
   constexpr int B_sm_dim3 = 64;
 
   // The 64 elements of type T in each 8x8 matrix are stored consecutively in a single layer of shared memory.
-  // T A_sm[A_sm_dim0 * A_sm_dim1 * A_sm_dim2 * A_sm_dim3];
-  // T B_sm[B_sm_dim0 * B_sm_dim1 * B_sm_dim2 * B_sm_dim3];
+  __shared__ T A_sm[A_sm_dim0 * A_sm_dim1 * A_sm_dim2 * A_sm_dim3];
+  __shared__ T B_sm[B_sm_dim0 * B_sm_dim1 * B_sm_dim2 * B_sm_dim3];
 
-  static_assert(BLOCK_TILE_M * LOOP_TILE_K % THREAD_COUNT == 0);
-  static_assert(BLOCK_TILE_M * LOOP_TILE_K / THREAD_COUNT % 8 == 0);
-  constexpr int A_LDG_COUNT_PER_THREAD = BLOCK_TILE_M * LOOP_TILE_K / THREAD_COUNT;
+  static_assert(BLOCK_M * LOOP_K % THREAD_COUNT == 0);
+  static_assert(BLOCK_M * LOOP_K / THREAD_COUNT % 8 == 0);
+  constexpr int A_LDG_COUNT_PER_THREAD = BLOCK_M * LOOP_K / THREAD_COUNT;
   constexpr int A_LDG_LOOP_COUNT       = A_LDG_COUNT_PER_THREAD / 8;
   // clang-format off
   // This is the thread layout of the same warp that loads matrix A, where each thread reads M1xK8 elements of type T at a
@@ -52,9 +46,9 @@ device_entry(const T* A, const T* B, T* C, int M, int N, int K, T* A_sm, T* B_sm
   // clang-format on
   float A_ldg_reg[LDG_REG_BUFFER_SIZE][A_LDG_LOOP_COUNT][4];
 
-  static_assert(BLOCK_TILE_N * LOOP_TILE_K % THREAD_COUNT == 0);
-  static_assert(BLOCK_TILE_N * LOOP_TILE_K / THREAD_COUNT % 8 == 0);
-  constexpr int B_LDG_COUNT_PER_THREAD = BLOCK_TILE_N * LOOP_TILE_K / THREAD_COUNT;
+  static_assert(BLOCK_N * LOOP_K % THREAD_COUNT == 0);
+  static_assert(BLOCK_N * LOOP_K / THREAD_COUNT % 8 == 0);
+  constexpr int B_LDG_COUNT_PER_THREAD = BLOCK_N * LOOP_K / THREAD_COUNT;
   constexpr int B_LDG_LOOP_COUNT       = B_LDG_COUNT_PER_THREAD / 8;
   // clang-format off
   // This is the thread layout of the same warp that loads matrix B, where each thread reads K1xN8 elements of type T at a
@@ -68,17 +62,17 @@ device_entry(const T* A, const T* B, T* C, int M, int N, int K, T* A_sm, T* B_sm
   // clang-format on
   float B_ldg_reg[LDG_REG_BUFFER_SIZE][B_LDG_LOOP_COUNT][4];
 
-  const int m_block_offset = blockIdx.y * BLOCK_TILE_M + m_offset;
-  const int n_block_offset = blockIdx.x * BLOCK_TILE_N + n_offset;
+  const int m_block_offset = blockIdx.y * BLOCK_M + m_offset;
+  const int n_block_offset = blockIdx.x * BLOCK_N + n_offset;
 
   const int warp_id                 = threadIdx.x / 32;
   const int lane_id                 = threadIdx.x % 32;
   const int transposed_lane_id_mask = (lane_id / 8 == 0 || lane_id / 8 == 3) ? 0x00 : 0x18;
   const int transposed_lane_id      = lane_id ^ transposed_lane_id_mask;
 
-  constexpr int M_MMA_WARP_COUNT       = BLOCK_TILE_M / WARP_TILE_M;
-  constexpr int M_GROUP_COUNT_PER_WARP = WARP_TILE_M / 8;
-  constexpr int N_GROUP_COUNT_PER_WARP = WARP_TILE_N / 16;
+  constexpr int M_MMA_WARP_COUNT       = BLOCK_M / WARP_M;
+  constexpr int M_GROUP_COUNT_PER_WARP = WARP_M / 8;
+  constexpr int N_GROUP_COUNT_PER_WARP = WARP_N / 16;
 
   static_assert(M_GROUP_COUNT_PER_WARP == 8);
   static_assert(N_GROUP_COUNT_PER_WARP == 4);
@@ -96,8 +90,8 @@ device_entry(const T* A, const T* B, T* C, int M, int N, int K, T* A_sm, T* B_sm
   };
   _2x4_or_1x8 C_transposed[M_GROUP_COUNT_PER_WARP][N_GROUP_COUNT_PER_WARP / 2];
 
-  const int m_warp_offset = warp_id % M_MMA_WARP_COUNT * WARP_TILE_M;
-  const int n_warp_offset = warp_id / M_MMA_WARP_COUNT * WARP_TILE_N;
+  const int m_warp_offset = warp_id % M_MMA_WARP_COUNT * WARP_M;
+  const int n_warp_offset = warp_id / M_MMA_WARP_COUNT * WARP_N;
 
   const int A_ldg_reg_2_A_sm_partial_offset =
     lane_id / 16 * A_sm_dim2 * A_sm_dim3 + (warp_id * 16 + lane_id % 16) * A_sm_dim3;
@@ -119,25 +113,25 @@ device_entry(const T* A, const T* B, T* C, int M, int N, int K, T* A_sm, T* B_sm
   const uint64_t A_global_ptr_for_ldg__loop_2__k_0 = (uint64_t)(A_global_ptr_for_ldg + 2 * WARP_COUNT * 16 * K + 0);
   const uint64_t A_global_ptr_for_ldg__loop_3__k_0 = (uint64_t)(A_global_ptr_for_ldg + 3 * WARP_COUNT * 16 * K + 0);
   const uint64_t A_global_ptr_for_ldg__loop_0__k_1 =
-    (uint64_t)(A_global_ptr_for_ldg + 0 * WARP_COUNT * 16 * K + LOOP_TILE_K);
+    (uint64_t)(A_global_ptr_for_ldg + 0 * WARP_COUNT * 16 * K + LOOP_K);
   const uint64_t A_global_ptr_for_ldg__loop_1__k_1 =
-    (uint64_t)(A_global_ptr_for_ldg + 1 * WARP_COUNT * 16 * K + LOOP_TILE_K);
+    (uint64_t)(A_global_ptr_for_ldg + 1 * WARP_COUNT * 16 * K + LOOP_K);
   const uint64_t A_global_ptr_for_ldg__loop_2__k_1 =
-    (uint64_t)(A_global_ptr_for_ldg + 2 * WARP_COUNT * 16 * K + LOOP_TILE_K);
+    (uint64_t)(A_global_ptr_for_ldg + 2 * WARP_COUNT * 16 * K + LOOP_K);
   const uint64_t A_global_ptr_for_ldg__loop_3__k_1 =
-    (uint64_t)(A_global_ptr_for_ldg + 3 * WARP_COUNT * 16 * K + LOOP_TILE_K);
+    (uint64_t)(A_global_ptr_for_ldg + 3 * WARP_COUNT * 16 * K + LOOP_K);
   const uint64_t B_global_ptr_for_ldg__loop_0__k_0 = (uint64_t)(B_global_ptr_for_ldg + 0 * WARP_COUNT * 16 + 0);
   const uint64_t B_global_ptr_for_ldg__loop_1__k_0 = (uint64_t)(B_global_ptr_for_ldg + 1 * WARP_COUNT * 16 + 0);
   const uint64_t B_global_ptr_for_ldg__loop_2__k_0 = (uint64_t)(B_global_ptr_for_ldg + 2 * WARP_COUNT * 16 + 0);
   const uint64_t B_global_ptr_for_ldg__loop_3__k_0 = (uint64_t)(B_global_ptr_for_ldg + 3 * WARP_COUNT * 16 + 0);
   const uint64_t B_global_ptr_for_ldg__loop_0__k_1 =
-    (uint64_t)(B_global_ptr_for_ldg + 0 * WARP_COUNT * 16 + LOOP_TILE_K * N);
+    (uint64_t)(B_global_ptr_for_ldg + 0 * WARP_COUNT * 16 + LOOP_K * N);
   const uint64_t B_global_ptr_for_ldg__loop_1__k_1 =
-    (uint64_t)(B_global_ptr_for_ldg + 1 * WARP_COUNT * 16 + LOOP_TILE_K * N);
+    (uint64_t)(B_global_ptr_for_ldg + 1 * WARP_COUNT * 16 + LOOP_K * N);
   const uint64_t B_global_ptr_for_ldg__loop_2__k_1 =
-    (uint64_t)(B_global_ptr_for_ldg + 2 * WARP_COUNT * 16 + LOOP_TILE_K * N);
+    (uint64_t)(B_global_ptr_for_ldg + 2 * WARP_COUNT * 16 + LOOP_K * N);
   const uint64_t B_global_ptr_for_ldg__loop_3__k_1 =
-    (uint64_t)(B_global_ptr_for_ldg + 3 * WARP_COUNT * 16 + LOOP_TILE_K * N);
+    (uint64_t)(B_global_ptr_for_ldg + 3 * WARP_COUNT * 16 + LOOP_K * N);
 
   const T* A_sm_ptr_for_ldg = &A_sm[A_ldg_reg_2_A_sm_partial_offset];
   const T* B_sm_ptr_for_ldg = &B_sm[B_ldg_reg_2_B_sm_partial_offset];
@@ -506,10 +500,10 @@ device_entry(const T* A, const T* B, T* C, int M, int N, int K, T* A_sm, T* B_sm
   __syncthreads();
 
   int       LDG_SM_BUFFER_INDEX = 0;
-  int       k_loop_offset       = LOOP_TILE_K * 2;
+  int       k_loop_offset       = LOOP_K * 2;
   int       k_loop_offset_x2    = k_loop_offset * sizeof(T);
   int       k_loop_offset_x2N   = k_loop_offset_x2 * N;
-  const int Nx2xLOOP_TILE_K     = LOOP_TILE_K * 2 * sizeof(T) * N;
+  const int Nx2xLOOP_K     = LOOP_K * 2 * sizeof(T) * N;
 
   alternate_ldm_mma_sts_stg_ldg(
     LDG_SM_BUFFER_INDEX, MMA_REG_BUFFER_INDEX_0, 0, 0, 0, 0, true, false, false, false, LDG_SWITCH_OFF);
@@ -526,7 +520,7 @@ device_entry(const T* A, const T* B, T* C, int M, int N, int K, T* A_sm, T* B_sm
                                 false,
                                 LDG_SWITCH_ON_EVICT_LAST);
 
-  while (k_loop_offset + LOOP_TILE_K * 2 < K) {
+  while (k_loop_offset + LOOP_K * 2 < K) {
     alternate_ldm_mma_sts_stg_ldg(LDG_SM_BUFFER_INDEX + 1,
                                   MMA_REG_BUFFER_INDEX_1,
                                   MMA_REG_BUFFER_INDEX_0,
@@ -562,9 +556,9 @@ device_entry(const T* A, const T* B, T* C, int M, int N, int K, T* A_sm, T* B_sm
                                   LDG_SWITCH_OFF);
 
     LDG_SM_BUFFER_INDEX ^= 2;
-    k_loop_offset += LOOP_TILE_K * 2;
-    k_loop_offset_x2 += LOOP_TILE_K * 2 * sizeof(T);
-    k_loop_offset_x2N += Nx2xLOOP_TILE_K;
+    k_loop_offset += LOOP_K * 2;
+    k_loop_offset_x2 += LOOP_K * 2 * sizeof(T);
+    k_loop_offset_x2N += Nx2xLOOP_K;
 
     __syncthreads();
 
@@ -605,9 +599,9 @@ device_entry(const T* A, const T* B, T* C, int M, int N, int K, T* A_sm, T* B_sm
                                   false,
                                   LDG_SWITCH_OFF);
     LDG_SM_BUFFER_INDEX ^= 2;
-    k_loop_offset += LOOP_TILE_K * 2;
-    k_loop_offset_x2 += LOOP_TILE_K * 2 * sizeof(T);
-    k_loop_offset_x2N += Nx2xLOOP_TILE_K;
+    k_loop_offset += LOOP_K * 2;
+    k_loop_offset_x2 += LOOP_K * 2 * sizeof(T);
+    k_loop_offset_x2N += Nx2xLOOP_K;
 
     __syncthreads();
 
@@ -660,68 +654,33 @@ device_entry(const T* A, const T* B, T* C, int M, int N, int K, T* A_sm, T* B_sm
 #undef alternate_ldm_mma_sts_stg_ldg
 }
 
-template<typename T, int BLOCK_TILE_M, int BLOCK_TILE_N, int, int, int WARP_TILE_M, int WARP_TILE_N>
-__global__ void
-fp16_mm_kernel(
-  const T* A, const T* B, T* C, int M, int N, int K)
-{
-  constexpr int LOOP_TILE_K         = 16;
-  constexpr int LDG_SM_BUFFER_SIZE  = 4;
-  constexpr int LDG_REG_BUFFER_SIZE = 2;
-
-  constexpr int A_sm_dim0 = LDG_SM_BUFFER_SIZE;
-  constexpr int A_sm_dim1 = 2;
-  constexpr int A_sm_dim2 = BLOCK_TILE_M / 2;
-  constexpr int A_sm_dim3 = LOOP_TILE_K / 2;
-  constexpr int B_sm_dim0 = LDG_SM_BUFFER_SIZE;
-  constexpr int B_sm_dim1 = LOOP_TILE_K / 8;
-  constexpr int B_sm_dim2 = BLOCK_TILE_N / 8 / 2;
-  constexpr int B_sm_dim3 = 64;
-
-  // The 64 elements of type T in each 8x8 matrix are stored consecutively in a single layer of shared memory.
-  __shared__ T A_sm[A_sm_dim0 * A_sm_dim1 * A_sm_dim2 * A_sm_dim3];
-  __shared__ T B_sm[B_sm_dim0 * B_sm_dim1 * B_sm_dim2 * B_sm_dim3];
-  device_entry<T, BLOCK_TILE_M / 2, BLOCK_TILE_N / 2, WARP_TILE_M, WARP_TILE_N>(A, B, C, M, N, K, A_sm, B_sm, 0, 0);
-  device_entry<T, BLOCK_TILE_M / 2, BLOCK_TILE_N / 2, WARP_TILE_M, WARP_TILE_N>(A, B, C, M, N, K, A_sm, B_sm, 0, 2048);
-  device_entry<T, BLOCK_TILE_M / 2, BLOCK_TILE_N / 2, WARP_TILE_M, WARP_TILE_N>(A, B, C, M, N, K, A_sm, B_sm, 2048, 0);
-  device_entry<T, BLOCK_TILE_M / 2, BLOCK_TILE_N / 2, WARP_TILE_M, WARP_TILE_N>(
-    A, B, C, M, N, K, A_sm, B_sm, 2048, 2048);
-  // device_entry<T, BLOCK_TILE_M, BLOCK_TILE_N / 2, WARP_TILE_M, WARP_TILE_N, 2048>(
-  //   A, B, C, M, N, K, C_mma_reg, A_sm, B_sm);
-}
-
-
 template<typename T, int BLOCK_M, int BLOCK_N, int BLOCK_M_SPLIT_COUNT, int BLOCK_N_SPLIT_COUNT, int WARP_M, int WARP_N>
-void launch_fp16_mm_kernel(const T* A, const T* B, T* C, int M, int N, int K, cudaStream_t stream)
+__global__ void fp16_mm(const T* A, const T* B, T* C, int M, int N, int K)
 {
-  if (std::is_same<T, half>::value == false && std::is_same<T, __nv_bfloat16>::value == false) {
-    throw std::runtime_error("T is not supported.");
+  const int m_per_split = (M + BLOCK_M_SPLIT_COUNT - 1) / BLOCK_M_SPLIT_COUNT;
+  const int n_per_split = (N + BLOCK_N_SPLIT_COUNT - 1) / BLOCK_N_SPLIT_COUNT;
+  static_assert(BLOCK_M_SPLIT_COUNT * BLOCK_N_SPLIT_COUNT <= 8);
+
+#define calculate(rank)                                                                                                \
+  {                                                                                                                    \
+    if constexpr (rank < BLOCK_M_SPLIT_COUNT * BLOCK_N_SPLIT_COUNT) {                                                  \
+      constexpr int ms = rank / BLOCK_N_SPLIT_COUNT;                                                                   \
+      constexpr int ns = rank % BLOCK_N_SPLIT_COUNT;                                                                   \
+      fp16_mm_splited<T, BLOCK_M / BLOCK_M_SPLIT_COUNT, BLOCK_N / BLOCK_N_SPLIT_COUNT, WARP_M, WARP_N>(                \
+        A, B, C, M, N, K, ms * m_per_split, ns * n_per_split);                                                         \
+    }                                                                                                                  \
   }
-  constexpr int LOOP_K = 16;
-  if (!(M % BLOCK_M == 0 && N % BLOCK_N == 0 && K % LOOP_K == 0)) {
-    throw std::runtime_error("M or N or K are not aligned.");
-  }
-  thread_local auto set_attr_result = []() {
-    auto kSmemSize   = 0;
-    auto kernel_func = &fp16_mm_kernel<T, BLOCK_M, BLOCK_N, BLOCK_M_SPLIT_COUNT, BLOCK_N_SPLIT_COUNT, WARP_M, WARP_N>;
-    CHECK_CUDA_RETURN(cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
-    return true;
-  }();
-  static_assert(8 <= BLOCK_M && (BLOCK_M & (BLOCK_M - 1)) == 0);
-  static_assert(16 <= BLOCK_N && (BLOCK_N & (BLOCK_N - 1)) == 0);
-  static_assert(LOOP_K == 16);
-  static_assert(BLOCK_M % BLOCK_M_SPLIT_COUNT == 0 && BLOCK_N % BLOCK_N_SPLIT_COUNT == 0);
-  constexpr int SPLITED_BLOCK_M = BLOCK_M / BLOCK_M_SPLIT_COUNT;
-  constexpr int SPLITED_BLOCK_N = BLOCK_N / BLOCK_N_SPLIT_COUNT;
-  static_assert(SPLITED_BLOCK_M % WARP_M == 0 && SPLITED_BLOCK_N % WARP_N == 0);
-  static_assert(WARP_N % 16 == 0 && WARP_M % 8 == 0);
-  constexpr int WARP_COUNT = SPLITED_BLOCK_N / WARP_N * SPLITED_BLOCK_M / WARP_M;
-  static_assert(1 <= WARP_COUNT && WARP_COUNT <= 32 && (WARP_COUNT & (WARP_COUNT - 1)) == 0);
-  printf("N = %03d, BLOCK_N = %03d, M = %03d, BLOCK_M = %03d\n", N, BLOCK_N, M, BLOCK_M);
-  dim3 grid(N / BLOCK_N, M / BLOCK_M);
-  dim3 block(WARP_COUNT * 32);
-  fp16_mm_kernel<T, BLOCK_M, BLOCK_N, BLOCK_M_SPLIT_COUNT, BLOCK_N_SPLIT_COUNT, WARP_M, WARP_N>
-    <<<grid, block>>>(A, B, C, M, N, K);
+
+  calculate(0);
+  calculate(1);
+  calculate(2);
+  calculate(3);
+  calculate(4);
+  calculate(5);
+  calculate(6);
+  calculate(7);
+
+#undef calculate
 }
 
 }  // namespace LLMMM

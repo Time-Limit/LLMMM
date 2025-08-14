@@ -1,3 +1,5 @@
-add_library(fp16_mm_impl STATIC impl.cc mm.cu)
+find_package(CUDA REQUIRED)
 
-set_target_properties(fp16_mm_impl PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+add_library(fp16_mm STATIC mm.cu)
+
+target_link_libraries(fp16_mm PRIVATE ${CUDA_LIBRARIES})
