@@ -25,3 +25,6 @@ target_link_libraries(004.fp16.mm.ldmatrix.trans PRIVATE cublas cublasLt ${CUDA_
 
 add_executable(004.fp16.cublas 004.fp16.cublas.cu)
 target_link_libraries(004.fp16.cublas PRIVATE cublas cublasLt ${CUDA_LIBRARIES})
+
+add_executable(005.fp8.cublas 005.fp8.cublas.cu)
+target_link_libraries(005.fp8.cublas PRIVATE cublas cublasLt ${CUDA_LIBRARIES})
