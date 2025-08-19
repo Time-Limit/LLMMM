@@ -1,5 +1,3 @@
-#include "fp16/mm.h"
-#include "kahan.h"
 #include "util/macro.h"
 #include "util/util.h"
 #include <cuda_fp8.h>
@@ -36,7 +34,8 @@ int test(int M, int N)
     for (int n = 0; n < N; ++n) {
       if (memcmp(&host[OFFSET(m, n, N)], &transposed_host[OFFSET(n, m, M)], sizeof(T))) {
         error++;
-      } else {
+      }
+      else {
         correct++;
       }
     }

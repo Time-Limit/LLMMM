@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cuda_runtime.h>
+#include <stdexcept>
+
 namespace LLMMM {
 
 #define thread_count_calculator()                                                                                      \
@@ -30,5 +33,8 @@ constexpr int host_thread_count_calculator()
 {
   thread_count_calculator();
 }
+
+template<typename T>
+void transpose_matrix__aligned_128(T* dst, T* src, int M, int N, cudaStream_t stream);
 
 }  // namespace LLMMM
