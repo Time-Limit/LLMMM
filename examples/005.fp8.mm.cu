@@ -7,6 +7,7 @@
 #include <cuda_pipeline_primitives.h>
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -52,12 +53,155 @@ __global__ void fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128(const __nv_
                                                                      const float*         A_scale_transposed,
                                                                      const __nv_fp8_e4m3* B_transposed,
                                                                      const float*         B_scale_transposed,
-                                                                     half*                C,
+                                                                     float*               C,
                                                                      float*               C_scale,
                                                                      int                  M,
                                                                      int                  N,
                                                                      int                  K)
 {
+  constexpr int M_WARP_COUNT     = BLOCK_M / WARP_M;
+  constexpr int N_WARP_COUNT     = BLOCK_N / WARP_N;
+  constexpr int WARP_COUNT       = M_WARP_COUNT * N_WARP_COUNT;
+  constexpr int THREAD_COUNT     = WARP_COUNT * 32;
+  constexpr int M_GROUP_PER_WARP = WARP_M / 8;
+  constexpr int N_GROUP_PER_WARP = WARP_N / 16;
+
+  using fp8_t = __nv_fp8_e4m3;
+
+  const int warp_id        = threadIdx.x / 32;
+  const int lane_id        = threadIdx.x % 32;
+  const int m_block_offset = BLOCK_M * blockIdx.y;
+  const int n_block_offset = BLOCK_N * blockIdx.x;
+  const int m_warp_offset  = warp_id % M_WARP_COUNT * WARP_M;
+  const int n_warp_offset  = warp_id / M_WARP_COUNT * WARP_N;
+
+  // LDG
+  __shared__ fp8_t A_sm[LOOP_K / 16][BLOCK_M][16];
+  float            A_scale_reg[M_GROUP_PER_WARP][2];  // A_scale_transposed is (K/128) x M
+  __shared__ fp8_t B_sm[LOOP_K / 16][BLOCK_N][16];
+  float            B_scale_reg;  // B_scale_transposed is (N/128) x (K/128)
+
+  constexpr int M_BYTE_PER_THREAD = BLOCK_M * LOOP_K / THREAD_COUNT;
+  static_assert(M_BYTE_PER_THREAD % 16 == 0);
+  constexpr int N_BYTE_PER_THREAD = BLOCK_N * LOOP_K / THREAD_COUNT;
+  static_assert(N_BYTE_PER_THREAD % 16 == 0);
+
+  constexpr int M_LDG_PER_THREAD = M_BYTE_PER_THREAD / 16;
+  constexpr int N_LDG_PER_THREAD = N_BYTE_PER_THREAD / 16;
+
+  fp8_t A_ldg_reg[M_LDG_PER_THREAD][16];
+  fp8_t B_ldg_reg[N_LDG_PER_THREAD][16];
+
+  // MMA
+  union {
+    uint16_t ldm[2][2];
+    fp8_t    mma[8];
+  } A_cal_reg[M_GROUP_PER_WARP];
+  union {
+    uint16_t ldm[4][2];
+    fp8_t    mma[16];
+  } B_cal_reg[N_GROUP_PER_WARP];
+
+  float C_cal_reg[M_GROUP_PER_WARP][N_GROUP_PER_WARP][4] = {0};
+
+  for (int k_block_offset = 0; k_block_offset < K; k_block_offset += 32) {
+    for (int m_loop = 0; m_loop < M_LDG_PER_THREAD; ++m_loop) {
+      /* T00 T08 ... T24 */
+      /* T01 T09 ... T25 */
+      /* T02 T10 ... T26 */
+      /* T03 T11 ... T27 */
+      /* T04 T12 ... T28 */
+      /* T05 T13 ... T29 */
+      /* T06 T14 ... T30 */
+      /* T07 T15 ... T31 */
+      const int m_loop_offset = (m_loop * THREAD_COUNT) * 16 / 64 % BLOCK_M;
+      const int k_loop_offset = (m_loop * THREAD_COUNT) * 16 / 64 / BLOCK_M * 64;
+      const int m_lane_offset = lane_id % 8;
+      const int k_lane_offset = lane_id / 8 * 16;
+      const int m_global      = m_block_offset + m_loop_offset + m_lane_offset;
+      const int k_global      = k_block_offset + k_loop_offset + k_lane_offset;
+      FETCH_FLOAT4(A_ldg_reg[m_loop], A[OFFSET(m_global, k_global, K)]);
+    }
+    for (int m_loop = 0; m_loop < M_LDG_PER_THREAD; ++m_loop) {
+      const int m_loop_offset = (m_loop * THREAD_COUNT) * 16 / 64 % BLOCK_M;
+      const int k_loop_offset = (m_loop * THREAD_COUNT) * 16 / 64 / BLOCK_M * 64;
+      const int m_lane_offset = lane_id % 8;
+      const int k_lane_offset = lane_id / 8 * 16;
+      const int m_sm          = m_loop_offset + m_lane_offset;
+      const int k_sm          = k_loop_offset + k_lane_offset;
+      STORE_FLOAT4(A_sm[k_sm / 16][m_sm][k_sm % 16], A_ldg_reg[m_loop]);
+    }
+    for (int n_loop = 0; n_loop < N_LDG_PER_THREAD; ++n_loop) {
+      /* T00 T08 ... T24 */
+      /* T01 T09 ... T25 */
+      /* T02 T10 ... T26 */
+      /* T03 T11 ... T27 */
+      /* T04 T12 ... T28 */
+      /* T05 T13 ... T29 */
+      /* T06 T14 ... T30 */
+      /* T07 T15 ... T31 */
+      const int n_loop_offset = (n_loop * THREAD_COUNT) * 16 / 64 % BLOCK_N;
+      const int k_loop_offset = (n_loop * THREAD_COUNT) * 16 / 64 / BLOCK_N * 64;
+      const int n_lane_offset = lane_id % 8;
+      const int k_lane_offset = lane_id / 8 * 16;
+      const int n_global      = n_block_offset + n_loop_offset + n_lane_offset;
+      const int k_global      = k_block_offset + k_loop_offset + k_lane_offset;
+      FETCH_FLOAT4(B_ldg_reg[n_loop], B_transposed[OFFSET(n_global, k_global, K)]);
+    }
+    for (int n_loop = 0; n_loop < N_LDG_PER_THREAD; ++n_loop) {
+      const int n_loop_offset = (n_loop * THREAD_COUNT) * 16 / 64 % BLOCK_N;
+      const int k_loop_offset = (n_loop * THREAD_COUNT) * 16 / 64 / BLOCK_N * 64;
+      const int n_lane_offset = lane_id % 8;
+      const int k_lane_offset = lane_id / 8 * 16;
+      const int n_sm          = n_loop_offset + n_lane_offset;
+      const int k_sm          = k_loop_offset + k_lane_offset;
+      STORE_FLOAT4(B_sm[k_sm / 16][n_sm][k_sm % 16], B_ldg_reg[n_loop]);
+    }
+    FETCH_FLOAT(B_scale_reg, B_scale_transposed[OFFSET(n_block_offset / 128, k_block_offset / 128, K / 128)]);
+    for (int mg = 0; mg < M_GROUP_PER_WARP; ++mg) {
+      FETCH_FLOAT2(
+        A_scale_reg[mg],
+        B_scale_transposed[OFFSET(k_block_offset / 128, m_block_offset + m_warp_offset + lane_id % 4 * 2, M)]);
+    }
+    __syncthreads();
+    for (int k_group_offset = 0; k_group_offset < LOOP_K; k_group_offset += 32) {
+      for (int mg = 0; mg < M_GROUP_PER_WARP; ++mg) {
+        /* 8 x 32 per group, ldmatrix.m8n8.x2.b16 */
+        int m_group_offset = m_warp_offset + mg * 8;
+        ldmatrix_sync_aligned_m8n8_x2_b16(
+          A_cal_reg[mg].ldm,
+          &A_sm[k_group_offset / 16 + lane_id / 8][m_group_offset + lane_id % 8][k_group_offset % 16]);
+      }
+      for (int ng = 0; ng < N_GROUP_PER_WARP; ++ng) {
+        /* 16 x 32 per group, ldmatrix.m8n8.x4.b16 */
+        int n_group_offset = n_warp_offset + ng * 16;
+        ldmatrix_sync_aligned_m8n8_x4_b16(B_cal_reg[ng].ldm,
+                                          &B_sm[k_group_offset / 16 + lane_id / 16][n_group_offset + lane_id % 16][0]);
+      }
+      for (int mg = 0; mg < M_GROUP_PER_WARP; ++mg) {
+        for (int ng = 0; ng < N_GROUP_PER_WARP; ++ng) {
+          float C_partial_mma_reg[4] = {0};
+          mma_m16n8k32_row_col(C_partial_mma_reg, B_cal_reg[ng].mma, A_cal_reg[mg].mma, C_partial_mma_reg);
+          C_cal_reg[mg][ng][0] += C_partial_mma_reg[0] * A_scale_reg[mg][0] * B_scale_reg;
+          C_cal_reg[mg][ng][1] += C_partial_mma_reg[1] * A_scale_reg[mg][0] * B_scale_reg;
+          C_cal_reg[mg][ng][2] += C_partial_mma_reg[2] * A_scale_reg[mg][1] * B_scale_reg;
+          C_cal_reg[mg][ng][3] += C_partial_mma_reg[3] * A_scale_reg[mg][1] * B_scale_reg;
+        }
+      }
+    }
+    __syncthreads();
+  }
+  constexpr int m_lane_offset[8] = {0, 2, 4, 6, 1, 3, 5, 7};
+  constexpr int n_lane_offset[4] = {0, 4, 8, 12};
+  for (int mg = 0; mg < M_GROUP_PER_WARP; ++mg) {
+    for (int ng = 0; ng < N_GROUP_PER_WARP; ++ng) {
+      LLMMM::shfl_1_and_0(C_cal_reg[mg][ng], 0x4, lane_id);
+      LLMMM::shfl_23_and_01(C_cal_reg[mg][ng], 0x8, lane_id);
+      const int m_global = m_block_offset + m_warp_offset + mg * 8 + m_lane_offset[lane_id % 8];
+      const int n_global = n_block_offset + n_warp_offset + ng * 16 + n_lane_offset[lane_id / 8];
+      STORE_FLOAT4(C[OFFSET(m_global, n_global, N)], C_cal_reg[mg][ng]);
+    }
+  }
 }
 
 template<bool C_SCALE_TRANSPOSE>
@@ -65,7 +209,7 @@ void fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128(const __nv_fp8_e4m3* A
                                                           const float*         A_scale_transposed,
                                                           const __nv_fp8_e4m3* B_transposed,
                                                           const float*         B_scale_transposed,
-                                                          half*                C,
+                                                          float*               C,
                                                           float*               C_scale,
                                                           int                  M,
                                                           int                  N,
@@ -77,10 +221,10 @@ void fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128(const __nv_fp8_e4m3* A
   constexpr int LOOP_K  = 128;
   constexpr int WARP_M  = 64;
   constexpr int WARP_N  = 64;
-  static_assert(BLOCK_M % WARP_M == 0);
-  static_assert(BLOCK_N % WARP_N == 0);
-  static_assert(WARP_M % 16 == 0);
-  static_assert(WARP_N % 8 == 0);
+  static_assert(BLOCK_M > 0 && BLOCK_M <= 128 && BLOCK_M % WARP_M == 0);
+  static_assert(BLOCK_M == 128 && BLOCK_N % WARP_N == 0);
+  static_assert(WARP_M > 0 && WARP_M % 8 == 0);  // mma.m16n8k32.row.col, A is n8k32, B is m16k32
+  static_assert(WARP_N > 0 && WARP_N % 16 == 0);
   static_assert(LOOP_K == 128);
   constexpr int WARP_COUNT = BLOCK_M / WARP_M * BLOCK_N / WARP_N;
   static_assert(0 < WARP_COUNT && WARP_COUNT <= 4 && (WARP_COUNT & (WARP_COUNT - 1)) == 0);
@@ -149,8 +293,9 @@ __global__ void fp8_blockwise_symmetric_quantization(const float* x, __nv_fp8_e4
         if (lane_id == 0) {
           if constexpr (SCALE_TRANPOSE) {
             STORE_FLOAT(scale[OFFSET(n_block_offset / QUANT_N, m, M)], s);
-          } else {
-          STORE_FLOAT(scale[OFFSET(m, n_block_offset / QUANT_N, scale_N)], s);
+          }
+          else {
+            STORE_FLOAT(scale[OFFSET(m, n_block_offset / QUANT_N, scale_N)], s);
           }
         }
       }
@@ -166,9 +311,9 @@ __global__ void fp8_blockwise_symmetric_quantization(const float* x, __nv_fp8_e4
     __syncthreads();
     float max4[4];
     FETCH_FLOAT4(max4[0], block_max_value[0]);
-    max = (max4[0] > max4[1]) ? max4[0] : max4[1];
-    max = (max > max4[2]) ? max : max4[2];
-    max = (max > max4[3]) ? max : max4[3];
+    max     = (max4[0] > max4[1]) ? max4[0] : max4[1];
+    max     = (max > max4[2]) ? max : max4[2];
+    max     = (max > max4[3]) ? max : max4[3];
     float s = max / fp8_e4m3_range;
     for (int loop = 0; loop < LOOP_COUNT; ++loop) {
       int m = m_block_offset + loop * WARP_COUNT + warp_id;
@@ -189,7 +334,8 @@ __global__ void fp8_blockwise_symmetric_quantization(const float* x, __nv_fp8_e4
         if constexpr (SCALE_TRANPOSE) {
           STORE_FLOAT(
             scale[OFFSET(n_block_offset / QUANT_N, (m_block_offset + loop * WARP_COUNT + warp_id) / QUANT_M, M)], s);
-        } else {
+        }
+        else {
           STORE_FLOAT(
             scale[OFFSET((m_block_offset + loop * WARP_COUNT + warp_id) / QUANT_M, n_block_offset / QUANT_N, scale_N)],
             s);
@@ -278,7 +424,7 @@ int main()
   }
 
   {
-    transpose_matrix__aligned_128(d_B_transposed, d_B, M, N, nullptr);
+    LLMMM::transpose_matrix__aligned_128(d_B_transposed, d_B, M, N, nullptr);
     CHECK_CUDA_ERROR();
   }
 
@@ -312,12 +458,52 @@ int main()
   fp8_blockwise_symmetric_quantization<128, 128, false>(d_B_transposed, d_B_q, d_B_s, K, N, nullptr);
   CHECK_CUDA_ERROR();
 
-  half*             d_C_fp16;
-  std::vector<half> h_C_fp16(M * N);
-  CHECK_CUDA_RETURN(cudaMalloc(&d_C_fp16, sizeof(half) * h_C_fp16.size()));
+  float*             d_C_fp32;
+  std::vector<float> h_C_fp32(M * N);
+  CHECK_CUDA_RETURN(cudaMalloc(&d_C_fp32, sizeof(float) * h_C_fp32.size()));
   fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128<true>(
-    d_A_q, d_A_s, d_B_q, d_B_s, d_C_fp16, d_C_s, M, N, K, nullptr);
+    d_A_q, d_A_s, d_B_q, d_B_s, d_C_fp32, d_C_s, M, N, K, nullptr);
   CHECK_CUDA_ERROR();
+
+  CHECK_CUDA_RETURN(cudaMemcpy(h_C_fp32.data(), d_C_fp32, sizeof(float) * h_C_fp32.size(), cudaMemcpyDefault));
+  {
+    float max_abs_error = std::numeric_limits<float>::min();
+    float base, exp;
+    int   error_m, error_n;
+    for (int m = 0; m < M && m < 64; ++m) {
+      for (int n = 0; n < N && n < 64; ++n) {
+        float diff = fabs(h_C[m * M + n] - h_C_fp32[m * M + n]);
+        if (diff > max_abs_error) {
+          max_abs_error = diff;
+          base          = h_C[m * M + n];
+          exp           = h_C_fp32[m * M + n];
+          error_m       = m;
+          error_n       = n;
+        }
+      }
+    }
+    printf("max_abs_error = %10.8f, max_relative_error = %10.8f, base = %10.8f, exp = %10.8f, m = %5d, n = %5d\n",
+           max_abs_error,
+           max_abs_error / fabs(base),
+           base,
+           exp,
+           error_m,
+           error_n);
+    printf("base\n");
+    for (int m = 0; m < M && m < 64; ++m) {
+      for (int n = 0; n < N && n < 64; ++n) {
+        printf("%10.3f ", h_C[m * N + n]);
+      }
+      printf("\n");
+    }
+    printf("exp\n");
+    for (int m = 0; m < M && m < 64; ++m) {
+      for (int n = 0; n < N && n < 64; ++n) {
+        printf("%10.3f ", h_C_fp32[m * N + n]);
+      }
+      printf("\n");
+    }
+  }
 
   CHECK_CUDA_RETURN(cudaFree(d_A));
   CHECK_CUDA_RETURN(cudaFree(d_B));
@@ -328,6 +514,6 @@ int main()
   CHECK_CUDA_RETURN(cudaFree(d_A_q));
   CHECK_CUDA_RETURN(cudaFree(d_B_q));
   CHECK_CUDA_RETURN(cudaFree(d_C_q));
-  CHECK_CUDA_RETURN(cudaFree(d_C_fp16));
+  CHECK_CUDA_RETURN(cudaFree(d_C_fp32));
   return 0;
 }
