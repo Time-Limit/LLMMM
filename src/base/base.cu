@@ -9,7 +9,7 @@ template<typename T, typename = std::enable_if_t<sizeof(T) == 1>>
 __global__ void transpose_matrix__aligned_128__T_size_1(T* dst, const T* src, int M, int N)
 {
   const int m_warp_count  = M / 128;
-  const int n_warp_count  = N / 128;
+  // const int n_warp_count  = N / 128;
   const int block_id      = blockIdx.x;
   const int warp_id       = threadIdx.x / 32;
   const int lane_id       = threadIdx.x % 32;
@@ -54,7 +54,7 @@ template<typename T, typename = std::enable_if_t<sizeof(T) == 4, T>>
 __global__ void transpose_matrix__aligned_128__T_size_4(T* dst, const T* src, int M, int N)
 {
   const int m_warp_count  = M / 64;
-  const int n_warp_count  = N / 64;
+  // const int n_warp_count  = N / 64;
   const int block_id      = blockIdx.x;
   const int warp_id       = threadIdx.x / 32;
   const int lane_id       = threadIdx.x % 32;

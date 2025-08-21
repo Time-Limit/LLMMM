@@ -7,7 +7,6 @@
 #include <cuda_runtime.h>
 #include <iostream>
 #include <random>
-#include <vector>
 
 void fp8Gemm(const int   m,
              const int   n,
@@ -108,8 +107,11 @@ void fp8Gemm(const int   m,
 // 生成随机FP32矩阵
 void generate_random_matrix(float* matrix, int rows, int cols)
 {
+  std::random_device                    rd;
+  std::mt19937                          gen(rd());
+  std::uniform_real_distribution<float> dis(-5, 5);
   for (int i = 0; i < rows * cols; ++i) {
-    matrix[i] = 1;
+    matrix[i] = dis(gen) / (fabs(dis(gen)) + 1.0000);
   }
 }
 
@@ -247,9 +249,7 @@ int main()
   CHECK(cudaMemcpy(d_B_scale, &scale_B, sizeof(float), cudaMemcpyDefault));
   // 执行FP8矩阵乘法
   std::cout << "执行FP8 E4M3矩阵乘法..." << std::endl;
-  // fp8Gemm(const int m, const int n, const int k, const void *A, const int lda, const void *B, const int ldb, void *C,
-  // const int ldc, float *a_scale, float *b_scale, bool fastAccum);
-  fp8Gemm(M, N, K, d_A_fp8, K, d_B_fp8, N, d_C_fp8, N, d_A_scale, d_B_scale, true);
+  fp8Gemm(M, N, K, d_A_fp8, K, d_B_fp8, N, d_C_fp8, N, d_A_scale, d_B_scale, false);
 
   // 复制结果回主机
   CHECK(cudaMemcpy(h_C_fp32, d_C_fp32, M * N * sizeof(float), cudaMemcpyDeviceToHost));

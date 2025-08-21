@@ -24,7 +24,7 @@ __device__ __inline__ bool this_thread_can_log(int thread_x = -1)
          && threadIdx.z == 0;
 }
 
-__device__ __inline__ void print_thread_info(const char* prefix)
+__device__ __inline__ void print_thread_info(const char* prefix = "")
 {
   printf("%s, block = %03d, %03d, %03d, thread = %03d %03d %03d\n",
          prefix,
@@ -120,6 +120,20 @@ __forceinline__ __device__ void shfl_1_and_0(T (&data)[N], uint32_t mask, int la
   _1 ^= swap;
 }
 
+template<typename T, int N, typename = std::enable_if_t<sizeof(T) == 4 and N >= 4>>
+__forceinline__ __device__ void shfl_3_and_2(T (&data)[N], uint32_t mask, int lane_id)
+{
+  uint32_t& _2   = *(uint32_t*)(&data[2]);
+  uint32_t& _3   = *(uint32_t*)(&data[3]);
+  uint32_t  swap = (_2 ^ _3) * (!(lane_id & mask));
+  _2 ^= swap;
+  _3 ^= swap;
+  _2   = __shfl_xor_sync(0xffffffff, _2, mask);
+  swap = (_2 ^ _3) * (!(lane_id & mask));
+  _2 ^= swap;
+  _3 ^= swap;
+}
+
 template<typename T, int N, typename = std::enable_if_t<(sizeof(T) == 2 || sizeof(T) == 4) && N >= 4>>
 __forceinline__ __device__ void shfl_23_and_01(T (&data)[N], uint32_t mask, int lane_id)
 {
@@ -205,6 +219,12 @@ __forceinline__ __device__ void ldmatrix_sync_aligned_m8n8_x4_b16(T (&dst)[4][2]
                  "=r"(*(uint32_t*)&dst[2][0]),
                  "=r"(*(uint32_t*)&dst[3][0])
                : "r"(src));
+}
+
+template<typename T, int N>
+__forceinline__ __device__ constexpr int get_array_size(const T (&data)[N])
+{
+  return N;
 }
 
 }  // namespace LLMMM
