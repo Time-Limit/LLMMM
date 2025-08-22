@@ -842,35 +842,47 @@ __global__ void fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8
     fp8_t    mma[16];
   } B_cal_reg[N_GROUP_PER_WARP];
 
-  float            C_cal_reg[M_GROUP_PER_WARP][N_GROUP_PER_WARP][4] = {0};
-  float            C_partial_mma_reg[2][4]                          = {0};
-  constexpr float4 ZERO                                             = {0, 0, 0, 0};
-  constexpr float  ZERO_ARR[4]                                      = {0, 0, 0, 0};
+  constexpr int C_PER_THREAD = WARP_M * WARP_N / 32;
+  static_assert(C_PER_THREAD < 128);
+  float           C_mma_reg[M_GROUP_PER_WARP][N_GROUP_PER_WARP][4];
+  float           C_cal_reg[M_GROUP_PER_WARP][N_GROUP_PER_WARP][4] = {0};
+  constexpr float ZERO_ARR[4]                                      = {0, 0, 0, 0};
 
-  const int A_ldg_m_offset = m_block_offset + warp_id * 32 * 8 / 32 + lane_id % 16 / 2;
-  const int B_ldg_n_offset = n_block_offset +  warp_id * 32 * 8 / 32  + lane_id % 16 / 2;
+  const int A_ldg_m_offset         = m_block_offset + warp_id * 32 * 8 / 32 + lane_id % 16 / 2;
+  const int B_ldg_n_offset         = n_block_offset + warp_id * 32 * 8 / 32 + lane_id % 16 / 2;
   const int A_ldg_and_sts_k_offset = (lane_id & 1) * 8 + (lane_id & 16);
   const int B_ldg_and_sts_k_offset = (lane_id & 1) * 8 + (lane_id & 16);
-  const int A_sts_m_offset = warp_id * 32 * 8 / 32 + lane_id % 16 / 2;
-  const int B_sts_n_offset = warp_id * 32 * 8 / 32 + lane_id % 16 / 2;
+  const int A_sts_m_offset         = warp_id * 32 * 8 / 32 + lane_id % 16 / 2;
+  const int B_sts_n_offset         = warp_id * 32 * 8 / 32 + lane_id % 16 / 2;
 
   constexpr int m_lane_offset[8] = {0, 2, 4, 6, 1, 3, 5, 7};
   constexpr int n_lane_offset[4] = {0, 8, 4, 12};
-  float max_val[M_GROUP_PER_WARP];
+  float         max_val[M_GROUP_PER_WARP];
 
-#define ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, rank)                       \
+  enum {
+    CAL_OFF = 0,
+    CAL_ON_FIRST,
+    CAL_ON_MIDDLE,
+    CAL_ON_LAST,
+  };
+
+#define ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, rank)                               \
   {                                                                                                                    \
-    if constexpr (mma_fma_switch && rank < MxN_GROUP_PER_WARP) {                                                       \
-      constexpr int mg            = rank % M_GROUP_PER_WARP;                                                           \
-      constexpr int ng            = rank / M_GROUP_PER_WARP;                                                           \
-      constexpr int reg_cur_index = rank % 2;                                                                          \
-      constexpr int reg_pre_index = (rank + 1) % 2;                                                                    \
-      mma_m16n8k32_row_col(C_partial_mma_reg[reg_cur_index], B_cal_reg[ng].mma, A_cal_reg[mg].mma, ZERO_ARR);          \
-      C_cal_reg[mg][ng][0] += C_partial_mma_reg[reg_cur_index][0] * A_scale_reg[mg][0];                                \
-      C_cal_reg[mg][ng][1] += C_partial_mma_reg[reg_cur_index][1] * A_scale_reg[mg][1];                                \
-      C_cal_reg[mg][ng][2] += C_partial_mma_reg[reg_cur_index][2] * A_scale_reg[mg][0];                                \
-      C_cal_reg[mg][ng][3] += C_partial_mma_reg[reg_cur_index][3] * A_scale_reg[mg][1];                                \
-      *(float4*)(&C_partial_mma_reg[reg_pre_index][0]) = ZERO;                                                         \
+    if constexpr (cal_switch && rank < MxN_GROUP_PER_WARP) {                                                           \
+      constexpr int mg = rank % M_GROUP_PER_WARP;                                                                      \
+      constexpr int ng = rank / M_GROUP_PER_WARP;                                                                      \
+      if constexpr (cal_switch == CAL_ON_FIRST) {                                                                      \
+        mma_m16n8k32_row_col(C_mma_reg[mg][ng], B_cal_reg[ng].mma, A_cal_reg[mg].mma, ZERO_ARR);                       \
+      }                                                                                                                \
+      else {                                                                                                           \
+        mma_m16n8k32_row_col(C_mma_reg[mg][ng], B_cal_reg[ng].mma, A_cal_reg[mg].mma, C_mma_reg[mg][ng]);              \
+      }                                                                                                                \
+      if constexpr (cal_switch == CAL_ON_LAST) {                                                                       \
+        C_cal_reg[mg][ng][0] += C_mma_reg[mg][ng][0] * A_scale_reg[mg][0];                                             \
+        C_cal_reg[mg][ng][1] += C_mma_reg[mg][ng][1] * A_scale_reg[mg][1];                                             \
+        C_cal_reg[mg][ng][2] += C_mma_reg[mg][ng][2] * A_scale_reg[mg][0];                                             \
+        C_cal_reg[mg][ng][3] += C_mma_reg[mg][ng][3] * A_scale_reg[mg][1];                                             \
+      }                                                                                                                \
     }                                                                                                                  \
     if constexpr (ldg_switch && rank < M_LDG_PER_THREAD) {                                                             \
       constexpr int m_loop        = rank;                                                                              \
@@ -943,7 +955,7 @@ __global__ void fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8
     if constexpr (rd_switch && rank < MxN_GROUP_PER_WARP) {                                                            \
       constexpr int mg = rank % M_GROUP_PER_WARP;                                                                      \
       constexpr int ng = rank / M_GROUP_PER_WARP;                                                                      \
-      if constexpr (mg == 0 && ng == 0) {                                                                                         \
+      if constexpr (mg == 0 && ng == 0) {                                                                              \
         max_val[mg] = fabs(C_cal_reg[mg][0][0]);                                                                       \
       }                                                                                                                \
       LLMMM::shfl_1_and_0(C_cal_reg[mg][ng], 0x4, lane_id);                                                            \
@@ -974,77 +986,133 @@ __global__ void fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8
     }                                                                                                                  \
   }
 
-#define ldg__sts__mma_fma__rd(ldg_switch, sts_switch, mma_fma_switch, rd_switch)                                       \
+#define ldg__sts__cal__rd(ldg_switch, sts_switch, cal_switch, rd_switch)                                               \
   {                                                                                                                    \
     constexpr int MxN_GROUP_PER_WARP = M_GROUP_PER_WARP * N_GROUP_PER_WARP;                                            \
     static_assert(MxN_GROUP_PER_WARP <= 32);                                                                           \
     static_assert(M_LDG_PER_THREAD <= MxN_GROUP_PER_WARP);                                                             \
     static_assert(N_LDG_PER_THREAD <= MxN_GROUP_PER_WARP);                                                             \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 0);                             \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 1);                             \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 2);                             \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 3);                             \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 4);                             \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 5);                             \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 6);                             \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 7);                             \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 8);                             \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 9);                             \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 10);                            \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 11);                            \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 12);                            \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 13);                            \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 14);                            \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 15);                            \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 16);                            \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 17);                            \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 18);                            \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 19);                            \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 20);                            \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 21);                            \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 22);                            \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 23);                            \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 24);                            \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 25);                            \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 26);                            \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 27);                            \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 28);                            \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 29);                            \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 30);                            \
-    ldg__sts__mma_fma__rd__per_rank(ldg_switch, sts_switch, mma_fma_switch, rd_switch, 31);                            \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 0);                                     \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 1);                                     \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 2);                                     \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 3);                                     \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 4);                                     \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 5);                                     \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 6);                                     \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 7);                                     \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 8);                                     \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 9);                                     \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 10);                                    \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 11);                                    \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 12);                                    \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 13);                                    \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 14);                                    \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 15);                                    \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 16);                                    \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 17);                                    \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 18);                                    \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 19);                                    \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 20);                                    \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 21);                                    \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 22);                                    \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 23);                                    \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 24);                                    \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 25);                                    \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 26);                                    \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 27);                                    \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 28);                                    \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 29);                                    \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 30);                                    \
+    ldg__sts__cal__rd__per_rank(ldg_switch, sts_switch, cal_switch, rd_switch, 31);                                    \
   }
 
   int k_block_offset = 0;
   while (k_block_offset < K) {
-    ldg__sts__mma_fma__rd(true, false, false, false);
-    ldg__sts__mma_fma__rd(false, true, false, false);
     FETCH_FLOAT(B_scale_reg, B_scale_transposed[OFFSET(n_block_offset / 128, k_block_offset / 128, K / 128)]);
     for (int mg = 0; mg < M_GROUP_PER_WARP; ++mg) {
       FETCH_FLOAT2(
         A_scale_reg[mg],
         A_scale_transposed[OFFSET(k_block_offset / 128, m_block_offset + m_warp_offset + mg * 8 + lane_id % 4 * 2, M)]);
     }
-    __syncthreads();
     for (int mg = 0; mg < M_GROUP_PER_WARP; ++mg) {
       A_scale_reg[mg][0] *= B_scale_reg;
       A_scale_reg[mg][1] *= B_scale_reg;
     }
-    for (int mg = 0; mg < M_GROUP_PER_WARP; ++mg) {
-      /* 8 x 32 per group, ldmatrix.m8n8.x2.b16 */
-      int m_group_offset = m_warp_offset + mg * 8;
-      ldmatrix_sync_aligned_m8n8_x2_b16(A_cal_reg[mg].ldm, &A_sm[lane_id / 8][m_group_offset + lane_id % 8][0]);
+    {
+      ldg__sts__cal__rd(true, false, CAL_OFF, false);
+      ldg__sts__cal__rd(false, true, CAL_OFF, false);
+      __syncthreads();
+      for (int mg = 0; mg < M_GROUP_PER_WARP; ++mg) {
+        /* 8 x 32 per group, ldmatrix.m8n8.x2.b16 */
+        int m_group_offset = m_warp_offset + mg * 8;
+        ldmatrix_sync_aligned_m8n8_x2_b16(A_cal_reg[mg].ldm, &A_sm[lane_id / 8][m_group_offset + lane_id % 8][0]);
+      }
+      for (int ng = 0; ng < N_GROUP_PER_WARP; ++ng) {
+        /* 16 x 32 per group, ldmatrix.m8n8.x4.b16 */
+        int n_group_offset = n_warp_offset + ng * 16;
+        ldmatrix_sync_aligned_m8n8_x4_b16(B_cal_reg[ng].ldm, &B_sm[lane_id / 16][n_group_offset + lane_id % 16][0]);
+      }
+      __syncthreads();
+      ldg__sts__cal__rd(false, false, CAL_ON_FIRST, false);
+      k_block_offset += PARTIAL_LOOP_K;
     }
-    for (int ng = 0; ng < N_GROUP_PER_WARP; ++ng) {
-      /* 16 x 32 per group, ldmatrix.m8n8.x4.b16 */
-      int n_group_offset = n_warp_offset + ng * 16;
-      ldmatrix_sync_aligned_m8n8_x4_b16(B_cal_reg[ng].ldm, &B_sm[lane_id / 16][n_group_offset + lane_id % 16][0]);
+    {
+      ldg__sts__cal__rd(true, false, CAL_OFF, false);
+      ldg__sts__cal__rd(false, true, CAL_OFF, false);
+      __syncthreads();
+      for (int mg = 0; mg < M_GROUP_PER_WARP; ++mg) {
+        /* 8 x 32 per group, ldmatrix.m8n8.x2.b16 */
+        int m_group_offset = m_warp_offset + mg * 8;
+        ldmatrix_sync_aligned_m8n8_x2_b16(A_cal_reg[mg].ldm, &A_sm[lane_id / 8][m_group_offset + lane_id % 8][0]);
+      }
+      for (int ng = 0; ng < N_GROUP_PER_WARP; ++ng) {
+        /* 16 x 32 per group, ldmatrix.m8n8.x4.b16 */
+        int n_group_offset = n_warp_offset + ng * 16;
+        ldmatrix_sync_aligned_m8n8_x4_b16(B_cal_reg[ng].ldm, &B_sm[lane_id / 16][n_group_offset + lane_id % 16][0]);
+      }
+      __syncthreads();
+      ldg__sts__cal__rd(false, false, CAL_ON_MIDDLE, false);
+      k_block_offset += PARTIAL_LOOP_K;
     }
-    __syncthreads();
-   ldg__sts__mma_fma__rd(false, false, true, false);
-   k_block_offset += PARTIAL_LOOP_K;
+    {
+      ldg__sts__cal__rd(true, false, CAL_OFF, false);
+      ldg__sts__cal__rd(false, true, CAL_OFF, false);
+      __syncthreads();
+      for (int mg = 0; mg < M_GROUP_PER_WARP; ++mg) {
+        /* 8 x 32 per group, ldmatrix.m8n8.x2.b16 */
+        int m_group_offset = m_warp_offset + mg * 8;
+        ldmatrix_sync_aligned_m8n8_x2_b16(A_cal_reg[mg].ldm, &A_sm[lane_id / 8][m_group_offset + lane_id % 8][0]);
+      }
+      for (int ng = 0; ng < N_GROUP_PER_WARP; ++ng) {
+        /* 16 x 32 per group, ldmatrix.m8n8.x4.b16 */
+        int n_group_offset = n_warp_offset + ng * 16;
+        ldmatrix_sync_aligned_m8n8_x4_b16(B_cal_reg[ng].ldm, &B_sm[lane_id / 16][n_group_offset + lane_id % 16][0]);
+      }
+      __syncthreads();
+      ldg__sts__cal__rd(false, false, CAL_ON_MIDDLE, false);
+      k_block_offset += PARTIAL_LOOP_K;
+    }
+    {
+      ldg__sts__cal__rd(true, false, CAL_OFF, false);
+      ldg__sts__cal__rd(false, true, CAL_OFF, false);
+      __syncthreads();
+      for (int mg = 0; mg < M_GROUP_PER_WARP; ++mg) {
+        /* 8 x 32 per group, ldmatrix.m8n8.x2.b16 */
+        int m_group_offset = m_warp_offset + mg * 8;
+        ldmatrix_sync_aligned_m8n8_x2_b16(A_cal_reg[mg].ldm, &A_sm[lane_id / 8][m_group_offset + lane_id % 8][0]);
+      }
+      for (int ng = 0; ng < N_GROUP_PER_WARP; ++ng) {
+        /* 16 x 32 per group, ldmatrix.m8n8.x4.b16 */
+        int n_group_offset = n_warp_offset + ng * 16;
+        ldmatrix_sync_aligned_m8n8_x4_b16(B_cal_reg[ng].ldm, &B_sm[lane_id / 16][n_group_offset + lane_id % 16][0]);
+      }
+      __syncthreads();
+      ldg__sts__cal__rd(false, false, CAL_ON_LAST, false);
+      k_block_offset += PARTIAL_LOOP_K;
+    }
   }
 
-  ldg__sts__mma_fma__rd(false, false, false, true);
+  ldg__sts__cal__rd(false, false, CAL_OFF, true);
 
   __syncthreads();
 
@@ -1057,12 +1125,12 @@ __global__ void fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8
     }
   }
 
-  constexpr float fp8_e4m3_range     = 448;
+  constexpr float fp8_e4m3_range = 448;
 
   for (int mg = 0; mg < M_GROUP_PER_WARP; ++mg) {
     const float scale_inv = fp8_e4m3_range / max_val[mg];
     const float scale     = max_val[mg] / fp8_e4m3_range;
-    const int m_global = m_block_offset + m_warp_offset + mg * 8 + m_lane_offset[lane_id % 8];
+    const int   m_global  = m_block_offset + m_warp_offset + mg * 8 + m_lane_offset[lane_id % 8];
     for (int ng = 0; ng < N_GROUP_PER_WARP; ++ng) {
       const int n_global = n_block_offset + n_warp_offset + ng * 16 + n_lane_offset[lane_id / 8];
       fp8_t     q[4]     = {fp8_t(C_cal_reg[mg][ng][0] * scale_inv),
@@ -1076,11 +1144,11 @@ __global__ void fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8
       STORE_FLOAT(C_scale_transposed[OFFSET(n_block_offset / 128, m_global, M)], scale);
     }
   }
-#undef ldg__sts__mma_fma__rd
-#undef ldg__sts__mma_fma__rd__per_rank
+#undef ldg__sts__cal__rd
+#undef ldg__sts__cal__rd__per_rank
 }
 
-#define launch(function)                                                                                     \
+#define launch(function)                                                                                               \
   void function(const __nv_fp8_e4m3* A,                                                                                \
                 const float*         A_scale_transposed,                                                               \
                 const __nv_fp8_e4m3* B_transposed,                                                                     \
@@ -1095,15 +1163,15 @@ __global__ void fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8
     constexpr int BLOCK_M = 128;                                                                                       \
     constexpr int BLOCK_N = 128;                                                                                       \
     constexpr int LOOP_K  = 128;                                                                                       \
-    constexpr int WARP_M  = 64;                                                                                        \
+    constexpr int WARP_M  = 32;                                                                                        \
     constexpr int WARP_N  = 64;                                                                                        \
     static_assert(BLOCK_M > 0 && BLOCK_M <= 128 && BLOCK_M % WARP_M == 0);                                             \
     static_assert(BLOCK_N == 128 && BLOCK_N % WARP_N == 0);                                                            \
     static_assert(WARP_M > 0 && WARP_M % 8 == 0); /* mma.m16n8k32.row.col, A is n8k32, B is m16k32 */                  \
     static_assert(WARP_N > 0 && WARP_N % 16 == 0);                                                                     \
     static_assert(LOOP_K == 128);                                                                                      \
-    constexpr int WARP_COUNT = BLOCK_M / WARP_M * BLOCK_N / WARP_N;                                                    \
-    static_assert(0 < WARP_COUNT && WARP_COUNT <= 4 && (WARP_COUNT & (WARP_COUNT - 1)) == 0);                          \
+    constexpr int WARP_COUNT   = BLOCK_M / WARP_M * BLOCK_N / WARP_N;                                                  \
+    static_assert(0 < WARP_COUNT && WARP_COUNT <= 8 && (WARP_COUNT & (WARP_COUNT - 1)) == 0);                          \
     if (!(M % BLOCK_M == 0 && N % BLOCK_N == 0 && K % LOOP_K == 0)) {                                                  \
       throw std::runtime_error("M or N or K are not aligned.");                                                        \
     }                                                                                                                  \
