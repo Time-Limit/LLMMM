@@ -8,7 +8,7 @@ namespace LLMMM {
 template<typename T, typename = std::enable_if_t<sizeof(T) == 1>>
 __global__ void transpose_matrix__aligned_128__T_size_1(T* dst, const T* src, int M, int N)
 {
-  const int m_warp_count  = M / 128;
+  const int m_warp_count = M / 128;
   // const int n_warp_count  = N / 128;
   const int block_id      = blockIdx.x;
   const int warp_id       = threadIdx.x / 32;
@@ -53,7 +53,7 @@ __global__ void transpose_matrix__aligned_128__T_size_1(T* dst, const T* src, in
 template<typename T, typename = std::enable_if_t<sizeof(T) == 4, T>>
 __global__ void transpose_matrix__aligned_128__T_size_4(T* dst, const T* src, int M, int N)
 {
-  const int m_warp_count  = M / 64;
+  const int m_warp_count = M / 64;
   // const int n_warp_count  = N / 64;
   const int block_id      = blockIdx.x;
   const int warp_id       = threadIdx.x / 32;
@@ -85,8 +85,8 @@ __global__ void transpose_matrix__aligned_128__T_size_4(T* dst, const T* src, in
   // }
   for (int m_loop = 0; m_loop < 4; ++m_loop) {
     for (int n_loop = 0; n_loop < 2; ++n_loop) {
-      const int m_loop_offset = n_loop * 32;
-      const int n_loop_offset = m_loop * 16;
+      const int m_loop_offset   = n_loop * 32;
+      const int n_loop_offset   = m_loop * 16;
       const int m               = n_warp_offset + m_loop_offset + lane_id % 8 * 4;
       const int n               = m_warp_offset + n_loop_offset + lane_id / 8 * 4;
       T         transposed_0[4] = {
@@ -96,21 +96,21 @@ __global__ void transpose_matrix__aligned_128__T_size_4(T* dst, const T* src, in
         data[m_loop][n_loop][3][0],
       };
       STORE_FLOAT4(dst[OFFSET(m, n, M)], transposed_0);
-      T         transposed_1[4] = {
+      T transposed_1[4] = {
         data[m_loop][n_loop][0][1],
         data[m_loop][n_loop][1][1],
         data[m_loop][n_loop][2][1],
         data[m_loop][n_loop][3][1],
       };
-      STORE_FLOAT4(dst[OFFSET(m+1, n, M)], transposed_1);
-      T         transposed_2[4] = {
+      STORE_FLOAT4(dst[OFFSET(m + 1, n, M)], transposed_1);
+      T transposed_2[4] = {
         data[m_loop][n_loop][0][2],
         data[m_loop][n_loop][1][2],
         data[m_loop][n_loop][2][2],
         data[m_loop][n_loop][3][2],
       };
-      STORE_FLOAT4(dst[OFFSET(m+2, n, M)], transposed_2);
-      T         transposed_3[4] = {
+      STORE_FLOAT4(dst[OFFSET(m + 2, n, M)], transposed_2);
+      T transposed_3[4] = {
         data[m_loop][n_loop][0][3],
         data[m_loop][n_loop][1][3],
         data[m_loop][n_loop][2][3],
@@ -152,4 +152,4 @@ void transpose_matrix__aligned_128(T* dst, T* src, int M, int N, cudaStream_t st
 
 template void transpose_matrix__aligned_128(__nv_fp8_e4m3* dst, __nv_fp8_e4m3* src, int M, int N, cudaStream_t stream);
 template void transpose_matrix__aligned_128(float* dst, float* src, int M, int N, cudaStream_t stream);
-}
+}  // namespace LLMMM
