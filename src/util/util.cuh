@@ -161,18 +161,31 @@ __forceinline__ __device__ void shfl_23_and_01(T (&data)[N], uint32_t mask, int 
   }
 }
 
-template<typename T, typename = std::enable_if_t<sizeof(T) == 2>>
+template<typename T, typename = std::enable_if_t<sizeof(T) == 2 || sizeof(T) == 1>>
 __forceinline__ __device__ void shfl_4567_and_0123(T (&data)[8], uint32_t mask, int lane_id)
 {
-  uint64_t& _0123 = *(uint64_t*)(&data[0]);
-  uint64_t& _4567 = *(uint64_t*)(&data[4]);
-  uint64_t  swap  = (_0123 ^ _4567) * (!(lane_id & mask));
-  _0123 ^= swap;
-  _4567 ^= swap;
-  _0123 = __shfl_xor_sync(0xffffffff, _0123, mask);
-  swap  = (_0123 ^ _4567) * (!(lane_id & mask));
-  _0123 ^= swap;
-  _4567 ^= swap;
+  if constexpr (sizeof(T) == 2) {
+    uint64_t& _0123 = *(uint64_t*)(&data[0]);
+    uint64_t& _4567 = *(uint64_t*)(&data[4]);
+    uint64_t  swap  = (_0123 ^ _4567) * (!(lane_id & mask));
+    _0123 ^= swap;
+    _4567 ^= swap;
+    _0123 = __shfl_xor_sync(0xffffffff, _0123, mask);
+    swap  = (_0123 ^ _4567) * (!(lane_id & mask));
+    _0123 ^= swap;
+    _4567 ^= swap;
+  }
+  if constexpr (sizeof(T) == 1) {
+    uint32_t& _0123 = *(uint32_t*)(&data[0]);
+    uint32_t& _4567 = *(uint32_t*)(&data[4]);
+    uint32_t  swap  = (_0123 ^ _4567) * (!(lane_id & mask));
+    _0123 ^= swap;
+    _4567 ^= swap;
+    _0123 = __shfl_xor_sync(0xffffffff, _0123, mask);
+    swap  = (_0123 ^ _4567) * (!(lane_id & mask));
+    _0123 ^= swap;
+    _4567 ^= swap;
+  }
 }
 
 __forceinline__ __device__ float warp_reduce_max(float val)

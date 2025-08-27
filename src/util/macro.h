@@ -47,6 +47,8 @@
 
 #define FETCH_FLOAT2(dst, src) *(float2*)(&(dst)) = *(const float2*)(&(src))
 
+#define FETCH_FLOAT2_WITH_SRC_PTR(dst, src) *(float2*)(&(dst)) = *(const float2*)(src)
+
 #define FETCH_FLOAT4(dst, src) *(float4*)(&(dst)) = *(const float4*)(&(src))
 
 #define FETCH_FLOAT4_WITH_PTR(dst, src) *(float4*)(dst) = *(const float4*)(src)

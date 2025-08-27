@@ -32,5 +32,8 @@ target_link_libraries(005.fp8.cublas PRIVATE cublas cublasLt ${CUDA_LIBRARIES})
 add_executable(005.fp8.mm 005.fp8.mm.cu)
 target_link_libraries(005.fp8.mm PRIVATE ${CUDA_LIBRARIES} base_kernel)
 
+add_executable(005.fp8.mm.nosm 005.fp8.mm.nosm.cu)
+target_link_libraries(005.fp8.mm.nosm PRIVATE ${CUDA_LIBRARIES} base_kernel)
+
 add_executable(005.fp8.test 005.fp8.test.cu)
 target_link_libraries(005.fp8.test PRIVATE ${CUDA_LIBRARIES})
