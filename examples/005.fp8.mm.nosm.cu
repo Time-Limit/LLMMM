@@ -206,7 +206,6 @@ __global__ void fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8
   constexpr int    LDG_S_REG_BUFFER_SIZE = 2;
   float            A_scale_reg[LDG_S_REG_BUFFER_SIZE][M_GROUP_PER_WARP][2];  // A_scale_transposed is (K/128) x M
   float            B_scale_reg;                                              // B_scale_transposed is (N/128) x (K/128)
-  __shared__ float C_block_extrema[M_WARP_COUNT][WARP_M][N_WARP_COUNT];
 
   constexpr int CAL_BUFFER_SIZE = 2;
   // MMA
@@ -223,9 +222,6 @@ __global__ void fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8
   float           C_cal_reg[M_GROUP_PER_WARP][N_GROUP_PER_WARP][4] = {0};
   constexpr float ZERO_ARR[4]                                      = {0, 0, 0, 0};
 
-  constexpr int m_lane_offset[8] = {0, 2, 4, 6, 1, 3, 5, 7};
-  float         max_val[M_GROUP_PER_WARP];
-
   enum {
     LDG_OFF = 0,
     LDG_ON_Q,
@@ -238,190 +234,176 @@ __global__ void fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8
     CAL_ON,
   };
 
-  enum {
-    RD_OFF = 0,
-    RD_ON,
-  };
-
-#define alternate__per_rank(ldg_switch, cal_switch, rd_switch, ldg_k, ldg_q_idx, cal_reg_idx, rank)                                                        \
-  {                                                                                                                                                        \
-    if constexpr (ldg_switch == LDG_ON_Q && rank < M_GROUP_PER_WARP) {                                                                                     \
-      constexpr int m_group        = rank;                                                                                                                 \
-      constexpr int m_group_offset = m_group * 8;                                                                                                          \
-      const int     m_lane_offset  = lane_id / 4;                                                                                                          \
-      const int     k_lane_offset  = lane_id % 4 * 8;                                                                                                      \
-      const int     m_global       = m_block_offset + m_warp_offset + m_group_offset + m_lane_offset;                                                      \
-      const int     k_global       = k_lane_offset + ldg_k;                                                                                                \
-      FETCH_FLOAT2(A_cal_reg[ldg_q_idx][m_group].ldg, A[OFFSET(m_global, k_global, K)]);                                                                   \
-    }                                                                                                                                                      \
-    if constexpr (ldg_switch == LDG_ON_Q && M_GROUP_PER_WARP <= rank && rank < M_GROUP_PER_WARP + N_GROUP_PER_WARP) {                                      \
-      constexpr int n_group        = rank - M_GROUP_PER_WARP;                                                                                              \
-      constexpr int n_group_offset = n_group * 16;                                                                                                         \
-      const int     n_lane_offset  = lane_id / 4 + (lane_id & 0x1) * 8;                                                                                    \
-      const int     k_lane_offset  = lane_id % 4 / 2 * 16;                                                                                                 \
-      const int     n_global       = n_block_offset + n_warp_offset + n_group_offset + n_lane_offset;                                                      \
-      const int     k_global       = k_lane_offset + ldg_k;                                                                                                \
-      FETCH_FLOAT4(B_cal_reg[ldg_q_idx][n_group].ldg, B_transposed[OFFSET(n_global, k_global, K)]);                                                        \
-    }                                                                                                                                                      \
-    if constexpr (ldg_switch == LDG_ON_S && rank == 0) {                                                                                                   \
-      FETCH_FLOAT(B_scale_reg, B_scale_transposed[OFFSET(n_block_offset / 128, ldg_k / 128, K / 128)]);                                                    \
-    }                                                                                                                                                      \
-    if constexpr (ldg_switch == LDG_ON_S && rank < M_GROUP_PER_WARP) {                                                                                     \
-      constexpr int mg = rank;                                                                                                                             \
-      FETCH_FLOAT2(                                                                                                                                        \
-        A_scale_reg[1][mg],                                                                                                                                \
-        A_scale_transposed[OFFSET(ldg_k / 128, m_block_offset + m_warp_offset + mg * 8 + lane_id % 4 * 2, M)]);                                            \
-    }                                                                                                                                                      \
-    if constexpr (ldg_switch == LDG_ON_S_POST && rank < M_GROUP_PER_WARP) {                                                                                \
-      constexpr int mg      = rank;                                                                                                                        \
-      A_scale_reg[0][mg][0] = A_scale_reg[1][mg][0] * B_scale_reg;                                                                                         \
-      A_scale_reg[0][mg][1] = A_scale_reg[1][mg][1] * B_scale_reg;                                                                                         \
-    }                                                                                                                                                      \
-    if constexpr (cal_switch && rank < MxN_GROUP_PER_WARP) {                                                                                               \
-      constexpr int mg  = rank % M_GROUP_PER_WARP;                                                                                                         \
-      constexpr int ng  = rank / M_GROUP_PER_WARP;                                                                                                         \
-      constexpr int idx = rank % 2;                                                                                                                        \
-      mma_m16n8k32_row_col(C_mma_reg[idx], B_cal_reg[cal_reg_idx][ng].mma, A_cal_reg[cal_reg_idx][mg].mma, ZERO_ARR);                                      \
-    }                                                                                                                                                      \
-    if constexpr (cal_switch && rank > 0 && rank <= MxN_GROUP_PER_WARP) {                                                                                  \
-      constexpr int mg  = (rank - 1) % M_GROUP_PER_WARP;                                                                                                   \
-      constexpr int ng  = (rank - 1) / M_GROUP_PER_WARP;                                                                                                   \
-      constexpr int idx = (rank - 1) % 2;                                                                                                                  \
-      asm volatile("fma.rn.f32 %0, %1, %2, %3;"                                                                                                            \
-                   : "=f"(C_cal_reg[mg][ng][0])                                                                                                            \
-                   : "f"(C_mma_reg[idx][0]), "f"(A_scale_reg[0][mg][0]), "f"(C_cal_reg[mg][ng][0]));                                                       \
-      asm volatile("fma.rn.f32 %0, %1, %2, %3;"                                                                                                            \
-                   : "=f"(C_cal_reg[mg][ng][1])                                                                                                            \
-                   : "f"(C_mma_reg[idx][1]), "f"(A_scale_reg[0][mg][1]), "f"(C_cal_reg[mg][ng][1]));                                                       \
-      asm volatile("fma.rn.f32 %0, %1, %2, %3;"                                                                                                            \
-                   : "=f"(C_cal_reg[mg][ng][2])                                                                                                            \
-                   : "f"(C_mma_reg[idx][2]), "f"(A_scale_reg[0][mg][0]), "f"(C_cal_reg[mg][ng][2]));                                                       \
-      asm volatile("fma.rn.f32 %0, %1, %2, %3;"                                                                                                            \
-                   : "=f"(C_cal_reg[mg][ng][3])                                                                                                            \
-                   : "f"(C_mma_reg[idx][3]), "f"(A_scale_reg[0][mg][1]), "f"(C_cal_reg[mg][ng][3]));                                                       \
-    }                                                                                                                                                      \
-    if constexpr (rd_switch && rank < MxN_GROUP_PER_WARP) {                                                                                                \
-      constexpr int mg = rank % M_GROUP_PER_WARP;                                                                                                          \
-      constexpr int ng = rank / M_GROUP_PER_WARP;                                                                                                          \
-      if constexpr (mg == 0 && ng == 0) {                                                                                                                  \
-        max_val[mg] = fabs(C_cal_reg[mg][0][0]);                                                                                                           \
-      }                                                                                                                                                    \
-      LLMMM::shfl_1_and_0(C_cal_reg[mg][ng], 0x4, lane_id);                                                                                                \
-      LLMMM::shfl_3_and_2(C_cal_reg[mg][ng], 0x4, lane_id);                                                                                                \
-      LLMMM::shfl_23_and_01(C_cal_reg[mg][ng], 0x8, lane_id);                                                                                              \
-                                                                                                                                                           \
-      constexpr int array_size = get_array_size(C_cal_reg[0][0]);                                                                                          \
-      for (int i = 0; i < array_size; ++i) {                                                                                                               \
-        max_val[mg] = max_val[mg] > fabs(C_cal_reg[mg][ng][i]) ? max_val[mg] : fabs(C_cal_reg[mg][ng][i]);                                                 \
-      }                                                                                                                                                    \
-      max_val[mg] = max(max_val[mg], __shfl_xor_sync(0xffffffff, max_val[mg], 0x10));                                                                      \
-      max_val[mg] = max(max_val[mg], __shfl_xor_sync(0xffffffff, max_val[mg], 0x08));                                                                      \
-      if constexpr (ng == N_GROUP_PER_WARP - 1) {                                                                                                          \
-        if (lane_id < 8) {                                                                                                                                 \
-          const int m = mg * 8 + m_lane_offset[lane_id];                                                                                                   \
-          STORE_FLOAT(C_block_extrema[m_warp_id][m][n_warp_id], max_val[mg]);                                                                              \
-        }                                                                                                                                                  \
-      }                                                                                                                                                    \
-    }                                                                                                                                                      \
+#define alternate__per_rank(ldg_switch, cal_switch, ldg_k, ldg_q_idx, cal_reg_idx, rank)                               \
+  {                                                                                                                    \
+    if constexpr (ldg_switch == LDG_ON_Q && rank < M_GROUP_PER_WARP) {                                                 \
+      constexpr int m_group        = rank;                                                                             \
+      constexpr int m_group_offset = m_group * 8;                                                                      \
+      const int     m_lane_offset  = lane_id / 4;                                                                      \
+      const int     k_lane_offset  = lane_id % 4 * 8;                                                                  \
+      const int     m_global       = m_block_offset + m_warp_offset + m_group_offset + m_lane_offset;                  \
+      const int     k_global       = k_lane_offset + ldg_k;                                                            \
+      FETCH_FLOAT2(A_cal_reg[ldg_q_idx][m_group].ldg, A[OFFSET(m_global, k_global, K)]);                               \
+    }                                                                                                                  \
+    if constexpr (ldg_switch == LDG_ON_Q && M_GROUP_PER_WARP <= rank && rank < M_GROUP_PER_WARP + N_GROUP_PER_WARP) {  \
+      constexpr int n_group        = rank - M_GROUP_PER_WARP;                                                          \
+      constexpr int n_group_offset = n_group * 16;                                                                     \
+      const int     n_lane_offset  = lane_id / 4 + (lane_id & 0x1) * 8;                                                \
+      const int     k_lane_offset  = lane_id % 4 / 2 * 16;                                                             \
+      const int     n_global       = n_block_offset + n_warp_offset + n_group_offset + n_lane_offset;                  \
+      const int     k_global       = k_lane_offset + ldg_k;                                                            \
+      FETCH_FLOAT4(B_cal_reg[ldg_q_idx][n_group].ldg, B_transposed[OFFSET(n_global, k_global, K)]);                    \
+    }                                                                                                                  \
+    if constexpr (ldg_switch == LDG_ON_S && rank == 0) {                                                               \
+      FETCH_FLOAT(B_scale_reg, B_scale_transposed[OFFSET(n_block_offset / 128, ldg_k / 128, K / 128)]);                \
+    }                                                                                                                  \
+    if constexpr (ldg_switch == LDG_ON_S && rank < M_GROUP_PER_WARP) {                                                 \
+      constexpr int mg = rank;                                                                                         \
+      FETCH_FLOAT2(                                                                                                    \
+        A_scale_reg[1][mg],                                                                                            \
+        A_scale_transposed[OFFSET(ldg_k / 128, m_block_offset + m_warp_offset + mg * 8 + lane_id % 4 * 2, M)]);        \
+    }                                                                                                                  \
+    if constexpr (ldg_switch == LDG_ON_S_POST && rank < M_GROUP_PER_WARP) {                                            \
+      constexpr int mg      = rank;                                                                                    \
+      A_scale_reg[0][mg][0] = A_scale_reg[1][mg][0] * B_scale_reg;                                                     \
+      A_scale_reg[0][mg][1] = A_scale_reg[1][mg][1] * B_scale_reg;                                                     \
+    }                                                                                                                  \
+    if constexpr (cal_switch && rank < MxN_GROUP_PER_WARP) {                                                           \
+      constexpr int mg  = rank % M_GROUP_PER_WARP;                                                                     \
+      constexpr int ng  = rank / M_GROUP_PER_WARP;                                                                     \
+      constexpr int idx = rank % 2;                                                                                    \
+      mma_m16n8k32_row_col(C_mma_reg[idx], B_cal_reg[cal_reg_idx][ng].mma, A_cal_reg[cal_reg_idx][mg].mma, ZERO_ARR);  \
+    }                                                                                                                  \
+    if constexpr (cal_switch && rank > 0 && rank <= MxN_GROUP_PER_WARP) {                                              \
+      constexpr int mg  = (rank - 1) % M_GROUP_PER_WARP;                                                               \
+      constexpr int ng  = (rank - 1) / M_GROUP_PER_WARP;                                                               \
+      constexpr int idx = (rank - 1) % 2;                                                                              \
+      C_cal_reg[mg][ng][0] += C_mma_reg[idx][0] * A_scale_reg[0][mg][0];                                               \
+      C_cal_reg[mg][ng][1] += C_mma_reg[idx][1] * A_scale_reg[0][mg][1];                                               \
+      C_cal_reg[mg][ng][2] += C_mma_reg[idx][2] * A_scale_reg[0][mg][0];                                               \
+      C_cal_reg[mg][ng][3] += C_mma_reg[idx][3] * A_scale_reg[0][mg][1];                                               \
+    }                                                                                                                  \
   }
 
-#define alternate(ldg_switch, cal_switch, rd_switch, ldg_k, ldg_q_idx, cal_reg_idx)                                    \
+#define alternate(ldg_switch, cal_switch, ldg_k, ldg_q_idx, cal_reg_idx)                                               \
   {                                                                                                                    \
     constexpr int MxN_GROUP_PER_WARP = M_GROUP_PER_WARP * N_GROUP_PER_WARP;                                            \
     static_assert(MxN_GROUP_PER_WARP <= 32);                                                                           \
     static_assert(M_GROUP_PER_WARP + N_GROUP_PER_WARP <= 32);                                                          \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 0);                    \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 1);                    \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 2);                    \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 3);                    \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 4);                    \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 5);                    \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 6);                    \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 7);                    \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 8);                    \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 9);                    \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 10);                   \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 11);                   \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 12);                   \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 13);                   \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 14);                   \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 15);                   \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 16);                   \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 17);                   \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 18);                   \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 19);                   \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 20);                   \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 21);                   \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 22);                   \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 23);                   \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 24);                   \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 25);                   \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 26);                   \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 27);                   \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 28);                   \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 29);                   \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 30);                   \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 31);                   \
-    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 32);                   \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 0);                               \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 1);                               \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 2);                               \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 3);                               \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 4);                               \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 5);                               \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 6);                               \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 7);                               \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 8);                               \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 9);                               \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 10);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 11);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 12);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 13);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 14);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 15);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 16);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 17);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 18);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 19);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 20);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 21);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 22);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 23);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 24);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 25);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 26);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 27);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 28);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 29);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 30);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 31);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 32);                              \
   }
 
   constexpr int IGN  = -1;
   constexpr int IDX0 = 0, IDX1 = 1;
 
   {
-    alternate(LDG_ON_S, CAL_OFF, RD_OFF, 0, IGN, IGN);
-    alternate(LDG_ON_Q, CAL_OFF, RD_OFF, 0, IDX0, IGN);
-    alternate(LDG_ON_S_POST, CAL_OFF, RD_OFF, IGN, IGN, IGN);
+    alternate(LDG_ON_S, CAL_OFF, 0, IGN, IGN);
+    alternate(LDG_ON_Q, CAL_OFF, 0, IDX0, IGN);
+    alternate(LDG_ON_S_POST, CAL_OFF, IGN, IGN, IGN);
   }
 
   int k_block_offset = 0;
   static_assert(LOOP_K == 128);
   while (k_block_offset + 128 < K) {
-    alternate(LDG_ON_S, CAL_OFF, RD_OFF, k_block_offset + 128, IGN, IGN);
+    alternate(LDG_ON_S, CAL_OFF, k_block_offset + 128, IGN, IGN);
     {
       k_block_offset += 32;
-      alternate(LDG_ON_Q, CAL_OFF, RD_OFF, k_block_offset, IDX1, IGN);
-      alternate(LDG_OFF, CAL_ON, RD_OFF, IGN, IGN, IDX0);
+      alternate(LDG_ON_Q, CAL_OFF, k_block_offset, IDX1, IGN);
+      alternate(LDG_OFF, CAL_ON, IGN, IGN, IDX0);
     }
     {
       k_block_offset += 32;
-      alternate(LDG_ON_Q, CAL_OFF, RD_OFF, k_block_offset, IDX0, IGN);
-      alternate(LDG_OFF, CAL_ON, RD_OFF, IGN, IGN, IDX1);
+      alternate(LDG_ON_Q, CAL_OFF, k_block_offset, IDX0, IGN);
+      alternate(LDG_OFF, CAL_ON, IGN, IGN, IDX1);
     }
     {
       k_block_offset += 32;
-      alternate(LDG_ON_Q, CAL_OFF, RD_OFF, k_block_offset, IDX1, IGN);
-      alternate(LDG_OFF, CAL_ON, RD_OFF, IGN, IGN, IDX0);
+      alternate(LDG_ON_Q, CAL_OFF, k_block_offset, IDX1, IGN);
+      alternate(LDG_OFF, CAL_ON, IGN, IGN, IDX0);
     }
     {
       k_block_offset += 32;
-      alternate(LDG_ON_Q, CAL_OFF, RD_OFF, k_block_offset, IDX0, IGN);
-      alternate(LDG_OFF, CAL_ON, RD_OFF, IGN, IGN, IDX1);
+      alternate(LDG_ON_Q, CAL_OFF, k_block_offset, IDX0, IGN);
+      alternate(LDG_OFF, CAL_ON, IGN, IGN, IDX1);
     }
-    alternate(LDG_ON_S_POST, CAL_OFF, RD_OFF, IGN, IGN, IGN);
+    alternate(LDG_ON_S_POST, CAL_OFF, IGN, IGN, IGN);
   }
   {
     {
       k_block_offset += 32;
-      alternate(LDG_ON_Q, CAL_OFF, RD_OFF, k_block_offset, IDX1, IGN);
-      alternate(LDG_OFF, CAL_ON, RD_OFF, IGN, IGN, IDX0);
+      alternate(LDG_ON_Q, CAL_OFF, k_block_offset, IDX1, IGN);
+      alternate(LDG_OFF, CAL_ON, IGN, IGN, IDX0);
     }
     {
       k_block_offset += 32;
-      alternate(LDG_ON_Q, CAL_OFF, RD_OFF, k_block_offset, IDX0, IGN);
-      alternate(LDG_OFF, CAL_ON, RD_OFF, IGN, IGN, IDX1);
+      alternate(LDG_ON_Q, CAL_OFF, k_block_offset, IDX0, IGN);
+      alternate(LDG_OFF, CAL_ON, IGN, IGN, IDX1);
     }
     {
       k_block_offset += 32;
-      alternate(LDG_ON_Q, CAL_OFF, RD_OFF, k_block_offset, IDX1, IGN);
-      alternate(LDG_OFF, CAL_ON, RD_OFF, IGN, IGN, IDX0);
+      alternate(LDG_ON_Q, CAL_OFF, k_block_offset, IDX1, IGN);
+      alternate(LDG_OFF, CAL_ON, IGN, IGN, IDX0);
     }
     {
-      alternate(LDG_OFF, CAL_ON, RD_OFF, IGN, IGN, IDX1);
+      alternate(LDG_OFF, CAL_ON, IGN, IGN, IDX1);
     }
   }
 
-  alternate(LDG_OFF, CAL_OFF, RD_ON, IGN, IGN, IGN);
+  constexpr int m_lane_offset[8] = {0, 2, 4, 6, 1, 3, 5, 7};
+  float         max_val[M_GROUP_PER_WARP];
+  __shared__ float C_block_extrema[M_WARP_COUNT][WARP_M][N_WARP_COUNT];
+
+  for (int mg = 0; mg < M_GROUP_PER_WARP; ++mg) {
+    max_val[mg] = fabs(C_cal_reg[mg][0][0]);
+    for (int ng = 0; ng < N_GROUP_PER_WARP; ++ng) {
+      LLMMM::shfl_1_and_0(C_cal_reg[mg][ng], 0x4, lane_id);
+      LLMMM::shfl_3_and_2(C_cal_reg[mg][ng], 0x4, lane_id);
+      LLMMM::shfl_23_and_01(C_cal_reg[mg][ng], 0x8, lane_id);
+
+      constexpr int array_size = get_array_size(C_cal_reg[0][0]);
+      for (int i = 0; i < array_size; ++i) {
+        max_val[mg] = max_val[mg] > fabs(C_cal_reg[mg][ng][i]) ? max_val[mg] : fabs(C_cal_reg[mg][ng][i]);
+      }
+      max_val[mg] = max(max_val[mg], __shfl_xor_sync(0xffffffff, max_val[mg], 0x10));
+      max_val[mg] = max(max_val[mg], __shfl_xor_sync(0xffffffff, max_val[mg], 0x08));
+    }
+    if (lane_id < 8) {
+      const int m = mg * 8 + m_lane_offset[lane_id];
+      STORE_FLOAT(C_block_extrema[m_warp_id][m][n_warp_id], max_val[mg]);
+    }
+  }
 
   __syncthreads();
 
