@@ -188,8 +188,6 @@ __global__ void fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8
 {
   constexpr int M_WARP_COUNT     = BLOCK_M / WARP_M;
   constexpr int N_WARP_COUNT     = BLOCK_N / WARP_N;
-  constexpr int WARP_COUNT       = M_WARP_COUNT * N_WARP_COUNT;
-  constexpr int THREAD_COUNT     = WARP_COUNT * 32;
   constexpr int M_GROUP_PER_WARP = WARP_M / 8;
   constexpr int N_GROUP_PER_WARP = WARP_N / 16;
 
@@ -205,55 +203,25 @@ __global__ void fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8
   const int n_warp_offset  = n_warp_id * WARP_N;
 
   // LDG
-  constexpr int PARTIAL_LOOP_K = 32;
-  static_assert(PARTIAL_LOOP_K == 32 && LOOP_K == PARTIAL_LOOP_K * 4);
-  constexpr int    LDG_SM_BUFFER_SIZE    = 4;
   constexpr int    LDG_S_REG_BUFFER_SIZE = 2;
-  __shared__ fp8_t A_sm[LDG_SM_BUFFER_SIZE][PARTIAL_LOOP_K / 16][BLOCK_M][16];
-  static_assert(LDG_SM_BUFFER_SIZE * PARTIAL_LOOP_K * BLOCK_M * sizeof(fp8_t) % 128 == 0);
   float            A_scale_reg[LDG_S_REG_BUFFER_SIZE][M_GROUP_PER_WARP][2];  // A_scale_transposed is (K/128) x M
-  __shared__ fp8_t B_sm[LDG_SM_BUFFER_SIZE][PARTIAL_LOOP_K / 16][BLOCK_N][16];
-  static_assert(LDG_SM_BUFFER_SIZE * PARTIAL_LOOP_K * BLOCK_N * sizeof(fp8_t) % 128 == 0);
-  float            B_scale_reg;  // B_scale_transposed is (N/128) x (K/128)
+  float            B_scale_reg;                                              // B_scale_transposed is (N/128) x (K/128)
   __shared__ float C_block_extrema[M_WARP_COUNT][WARP_M][N_WARP_COUNT];
-  static_assert(M_WARP_COUNT * WARP_M * N_WARP_COUNT * sizeof(float) % 128 == 0);
-
-  // PARTIAL_LOOP_K is aimed at reducing register usage.
-  constexpr int BYTE_PER_LDG      = sizeof(float2);
-  constexpr int M_BYTE_PER_THREAD = BLOCK_M * PARTIAL_LOOP_K / THREAD_COUNT;
-  static_assert(M_BYTE_PER_THREAD % BYTE_PER_LDG == 0);
-  constexpr int N_BYTE_PER_THREAD = BLOCK_N * PARTIAL_LOOP_K / THREAD_COUNT;
-  static_assert(N_BYTE_PER_THREAD % BYTE_PER_LDG == 0);
-
-  constexpr int M_LDG_PER_THREAD = M_BYTE_PER_THREAD / BYTE_PER_LDG;
-  constexpr int N_LDG_PER_THREAD = N_BYTE_PER_THREAD / BYTE_PER_LDG;
-
-  constexpr int LDG_Q_REG_BUFFER_SIZE = 2;
-  fp8_t         A_ldg_reg[LDG_Q_REG_BUFFER_SIZE][M_LDG_PER_THREAD][BYTE_PER_LDG];
-  fp8_t         B_ldg_reg[LDG_Q_REG_BUFFER_SIZE][N_LDG_PER_THREAD][BYTE_PER_LDG];
 
   constexpr int CAL_BUFFER_SIZE = 2;
-
   // MMA
   union {
-    uint16_t ldm[2][2];
-    fp8_t    mma[8];
+    float ldg[2];
+    fp8_t mma[8];
   } A_cal_reg[CAL_BUFFER_SIZE][M_GROUP_PER_WARP];
   union {
-    uint16_t ldm[4][2];
-    fp8_t    mma[16];
+    float ldg[4];
+    fp8_t mma[16];
   } B_cal_reg[CAL_BUFFER_SIZE][N_GROUP_PER_WARP];
 
   float           C_mma_reg[2][4];
   float           C_cal_reg[M_GROUP_PER_WARP][N_GROUP_PER_WARP][4] = {0};
   constexpr float ZERO_ARR[4]                                      = {0, 0, 0, 0};
-
-  const int A_ldg_m_offset         = m_block_offset + warp_id * 32 * 8 / 32 + lane_id % 16 / 2;
-  const int B_ldg_n_offset         = n_block_offset + warp_id * 32 * 8 / 32 + lane_id % 16 / 2;
-  const int A_ldg_and_sts_k_offset = (lane_id & 1) * 8 + (lane_id & 16);
-  const int B_ldg_and_sts_k_offset = (lane_id & 1) * 8 + (lane_id & 16);
-  const int A_sts_m_offset         = warp_id * 32 * 8 / 32 + lane_id % 16 / 2;
-  const int B_sts_n_offset         = warp_id * 32 * 8 / 32 + lane_id % 16 / 2;
 
   constexpr int m_lane_offset[8] = {0, 2, 4, 6, 1, 3, 5, 7};
   float         max_val[M_GROUP_PER_WARP];
@@ -266,20 +234,8 @@ __global__ void fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8
   };
 
   enum {
-    STS_OFF = 0,
-    STS_ON,
-  };
-
-  enum {
-    LDM_OFF = 0,
-    LDM_ON,
-  };
-
-  enum {
     CAL_OFF = 0,
-    CAL_ON_FIRST,
-    CAL_ON_MIDDLE,
-    CAL_ON_LAST,
+    CAL_ON,
   };
 
   enum {
@@ -287,261 +243,185 @@ __global__ void fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8
     RD_ON,
   };
 
-#define alternate__per_rank(ldg_switch,                                                                                \
-                            sts_switch,                                                                                \
-                            ldm_switch,                                                                                \
-                            cal_switch,                                                                                \
-                            rd_switch,                                                                                 \
-                            ldg_k,                                                                                     \
-                            ldg_q_idx,                                                                                 \
-                            sts_sm_idx,                                                                                \
-                            sts_reg_idx,                                                                               \
-                            ldm_sm_idx,                                                                                \
-                            ldm_reg_idx,                                                                               \
-                            cal_reg_idx,                                                                               \
-                            rank)                                                                                      \
-  {                                                                                                                    \
-    if constexpr (ldg_switch == LDG_ON_Q && rank < M_LDG_PER_THREAD) {                                                 \
-      constexpr int m_loop        = rank;                                                                              \
-      constexpr int m_loop_offset = m_loop * THREAD_COUNT * 8 / 32;                                                    \
-      const int     m_global      = A_ldg_m_offset + m_loop_offset;                                                    \
-      const int     k_global      = A_ldg_and_sts_k_offset + ldg_k;                                                    \
-      FETCH_FLOAT2(A_ldg_reg[ldg_q_idx][m_loop], A[OFFSET(m_global, k_global, K)]);                                    \
-    }                                                                                                                  \
-    if constexpr (ldg_switch == LDG_ON_Q && M_LDG_PER_THREAD <= rank && rank < M_LDG_PER_THREAD + N_LDG_PER_THREAD) {  \
-      constexpr int n_loop        = rank - M_LDG_PER_THREAD;                                                           \
-      constexpr int n_loop_offset = n_loop * THREAD_COUNT * 8 / 32;                                                    \
-      const int     n_global      = B_ldg_n_offset + n_loop_offset;                                                    \
-      const int     k_global      = B_ldg_and_sts_k_offset + ldg_k;                                                    \
-      FETCH_FLOAT2(B_ldg_reg[ldg_q_idx][n_loop], B_transposed[OFFSET(n_global, k_global, K)]);                         \
-    }                                                                                                                  \
-    if constexpr (ldg_switch == LDG_ON_S && rank == 0) {                                                               \
-      FETCH_FLOAT(B_scale_reg, B_scale_transposed[OFFSET(n_block_offset / 128, ldg_k / 128, K / 128)]);                \
-    }                                                                                                                  \
-    if constexpr (ldg_switch == LDG_ON_S && rank < M_GROUP_PER_WARP) {                                                 \
-      constexpr int mg = rank;                                                                                         \
-      FETCH_FLOAT2(                                                                                                    \
-        A_scale_reg[1][mg],                                                                                            \
-        A_scale_transposed[OFFSET(ldg_k / 128, m_block_offset + m_warp_offset + mg * 8 + lane_id % 4 * 2, M)]);        \
-    }                                                                                                                  \
-    if constexpr (ldg_switch == LDG_ON_S_POST && rank < M_GROUP_PER_WARP) {                                            \
-      constexpr int mg      = rank;                                                                                    \
-      A_scale_reg[0][mg][0] = A_scale_reg[1][mg][0] * B_scale_reg;                                                     \
-      A_scale_reg[0][mg][1] = A_scale_reg[1][mg][1] * B_scale_reg;                                                     \
-    }                                                                                                                  \
-    if constexpr (cal_switch && rank < MxN_GROUP_PER_WARP) {                                                           \
-      constexpr int mg  = rank % M_GROUP_PER_WARP;                                                                     \
-      constexpr int ng  = rank / M_GROUP_PER_WARP;                                                                     \
-      constexpr int idx = rank % 2;                                                                                    \
-      mma_m16n8k32_row_col(C_mma_reg[idx], B_cal_reg[cal_reg_idx][ng].mma, A_cal_reg[cal_reg_idx][mg].mma, ZERO_ARR);  \
-    }                                                                                                                  \
-    if constexpr (cal_switch && rank > 0 && rank <= MxN_GROUP_PER_WARP) {                                              \
-      constexpr int mg  = (rank - 1) % M_GROUP_PER_WARP;                                                               \
-      constexpr int ng  = (rank - 1) / M_GROUP_PER_WARP;                                                               \
-      constexpr int idx = (rank - 1) % 2;                                                                              \
-      asm volatile("fma.rn.f32 %0, %1, %2, %3;"                                                                        \
-                   : "=f"(C_cal_reg[mg][ng][0])                                                                        \
-                   : "f"(C_mma_reg[idx][0]), "f"(A_scale_reg[0][mg][0]), "f"(C_cal_reg[mg][ng][0]));                   \
-      asm volatile("fma.rn.f32 %0, %1, %2, %3;"                                                                        \
-                   : "=f"(C_cal_reg[mg][ng][1])                                                                        \
-                   : "f"(C_mma_reg[idx][1]), "f"(A_scale_reg[0][mg][1]), "f"(C_cal_reg[mg][ng][1]));                   \
-      asm volatile("fma.rn.f32 %0, %1, %2, %3;"                                                                        \
-                   : "=f"(C_cal_reg[mg][ng][2])                                                                        \
-                   : "f"(C_mma_reg[idx][2]), "f"(A_scale_reg[0][mg][0]), "f"(C_cal_reg[mg][ng][2]));                   \
-      asm volatile("fma.rn.f32 %0, %1, %2, %3;"                                                                        \
-                   : "=f"(C_cal_reg[mg][ng][3])                                                                        \
-                   : "f"(C_mma_reg[idx][3]), "f"(A_scale_reg[0][mg][1]), "f"(C_cal_reg[mg][ng][3]));                   \
-    }                                                                                                                  \
-    if constexpr (ldm_switch && rank < M_GROUP_PER_WARP) {                                                             \
-      constexpr int mg = rank;                                                                                         \
-      /* 8 x 32 per group, ldmatrix.m8n8.x2.b16 */                                                                     \
-      int m_group_offset = m_warp_offset + mg * 8;                                                                     \
-      ldmatrix_sync_aligned_m8n8_x2_b16(A_cal_reg[ldm_reg_idx][mg].ldm,                                                \
-                                        &A_sm[ldm_sm_idx][lane_id / 8][m_group_offset + lane_id % 8][0]);              \
-    }                                                                                                                  \
-    if constexpr (ldm_switch && M_GROUP_PER_WARP <= rank && rank < M_GROUP_PER_WARP + N_GROUP_PER_WARP) {              \
-      constexpr int ng = rank - M_GROUP_PER_WARP;                                                                      \
-      /* 16 x 32 per group, ldmatrix.m8n8.x4.b16 */                                                                    \
-      int n_group_offset = n_warp_offset + ng * 16;                                                                    \
-      ldmatrix_sync_aligned_m8n8_x4_b16(B_cal_reg[ldm_reg_idx][ng].ldm,                                                \
-                                        &B_sm[ldm_sm_idx][lane_id / 16][n_group_offset + lane_id % 16][0]);            \
-    }                                                                                                                  \
-    constexpr int STS_RANK_OFFSET = MxN_GROUP_PER_WARP - M_LDG_PER_THREAD - N_LDG_PER_THREAD;                          \
-    if constexpr (sts_switch && STS_RANK_OFFSET <= rank && rank < STS_RANK_OFFSET + M_LDG_PER_THREAD) {                \
-      constexpr int m_loop        = rank - STS_RANK_OFFSET;                                                            \
-      constexpr int m_loop_offset = m_loop * THREAD_COUNT * 8 / 32;                                                    \
-      const int     m_sm          = m_loop_offset + A_sts_m_offset;                                                    \
-      const int     k_sm          = A_ldg_and_sts_k_offset;                                                            \
-      STORE_FLOAT2(A_sm[sts_sm_idx][k_sm / 16][m_sm][k_sm % 16], A_ldg_reg[sts_reg_idx][m_loop]);                      \
-    }                                                                                                                  \
-    if constexpr (sts_switch && STS_RANK_OFFSET + M_LDG_PER_THREAD <= rank                                             \
-                  && rank < STS_RANK_OFFSET + M_LDG_PER_THREAD + N_LDG_PER_THREAD) {                                   \
-      constexpr int n_loop        = rank - M_LDG_PER_THREAD - STS_RANK_OFFSET;                                         \
-      constexpr int n_loop_offset = n_loop * THREAD_COUNT * 8 / 32;                                                    \
-      const int     n_sm          = n_loop_offset + B_sts_n_offset;                                                    \
-      const int     k_sm          = B_ldg_and_sts_k_offset;                                                            \
-      STORE_FLOAT2(B_sm[sts_sm_idx][k_sm / 16][n_sm][k_sm % 16], B_ldg_reg[sts_reg_idx][n_loop]);                      \
-    }                                                                                                                  \
-    if constexpr (rd_switch && rank < MxN_GROUP_PER_WARP) {                                                            \
-      constexpr int mg = rank % M_GROUP_PER_WARP;                                                                      \
-      constexpr int ng = rank / M_GROUP_PER_WARP;                                                                      \
-      if constexpr (mg == 0 && ng == 0) {                                                                              \
-        max_val[mg] = fabs(C_cal_reg[mg][0][0]);                                                                       \
-      }                                                                                                                \
-      LLMMM::shfl_1_and_0(C_cal_reg[mg][ng], 0x4, lane_id);                                                            \
-      LLMMM::shfl_3_and_2(C_cal_reg[mg][ng], 0x4, lane_id);                                                            \
-      LLMMM::shfl_23_and_01(C_cal_reg[mg][ng], 0x8, lane_id);                                                          \
-                                                                                                                       \
-      constexpr int array_size = get_array_size(C_cal_reg[0][0]);                                                      \
-      for (int i = 0; i < array_size; ++i) {                                                                           \
-        max_val[mg] = max_val[mg] > fabs(C_cal_reg[mg][ng][i]) ? max_val[mg] : fabs(C_cal_reg[mg][ng][i]);             \
-      }                                                                                                                \
-      max_val[mg] = max(max_val[mg], __shfl_xor_sync(0xffffffff, max_val[mg], 0x10));                                  \
-      max_val[mg] = max(max_val[mg], __shfl_xor_sync(0xffffffff, max_val[mg], 0x08));                                  \
-      if constexpr (ng == N_GROUP_PER_WARP - 1) {                                                                      \
-        if (lane_id < 8) {                                                                                             \
-          const int m = mg * 8 + m_lane_offset[lane_id];                                                               \
-          STORE_FLOAT(C_block_extrema[m_warp_id][m][n_warp_id], max_val[mg]);                                          \
-        }                                                                                                              \
-      }                                                                                                                \
-    }                                                                                                                  \
+#define alternate__per_rank(ldg_switch, cal_switch, rd_switch, ldg_k, ldg_q_idx, cal_reg_idx, rank)                                                        \
+  {                                                                                                                                                        \
+    if constexpr (ldg_switch == LDG_ON_Q && rank < M_GROUP_PER_WARP) {                                                                                     \
+      constexpr int m_group        = rank;                                                                                                                 \
+      constexpr int m_group_offset = m_group * 8;                                                                                                          \
+      const int     m_lane_offset  = lane_id / 4;                                                                                                          \
+      const int     k_lane_offset  = lane_id % 4 * 8;                                                                                                      \
+      const int     m_global       = m_block_offset + m_warp_offset + m_group_offset + m_lane_offset;                                                      \
+      const int     k_global       = k_lane_offset + ldg_k;                                                                                                \
+      FETCH_FLOAT2(A_cal_reg[ldg_q_idx][m_group].ldg, A[OFFSET(m_global, k_global, K)]);                                                                   \
+    }                                                                                                                                                      \
+    if constexpr (ldg_switch == LDG_ON_Q && M_GROUP_PER_WARP <= rank && rank < M_GROUP_PER_WARP + N_GROUP_PER_WARP) {                                      \
+      constexpr int n_group        = rank - M_GROUP_PER_WARP;                                                                                              \
+      constexpr int n_group_offset = n_group * 16;                                                                                                         \
+      const int     n_lane_offset  = lane_id / 4 + (lane_id & 0x1) * 8;                                                                                    \
+      const int     k_lane_offset  = lane_id % 4 / 2 * 16;                                                                                                 \
+      const int     n_global       = n_block_offset + n_warp_offset + n_group_offset + n_lane_offset;                                                      \
+      const int     k_global       = k_lane_offset + ldg_k;                                                                                                \
+      FETCH_FLOAT4(B_cal_reg[ldg_q_idx][n_group].ldg, B_transposed[OFFSET(n_global, k_global, K)]);                                                        \
+    }                                                                                                                                                      \
+    if constexpr (ldg_switch == LDG_ON_S && rank == 0) {                                                                                                   \
+      FETCH_FLOAT(B_scale_reg, B_scale_transposed[OFFSET(n_block_offset / 128, ldg_k / 128, K / 128)]);                                                    \
+    }                                                                                                                                                      \
+    if constexpr (ldg_switch == LDG_ON_S && rank < M_GROUP_PER_WARP) {                                                                                     \
+      constexpr int mg = rank;                                                                                                                             \
+      FETCH_FLOAT2(                                                                                                                                        \
+        A_scale_reg[1][mg],                                                                                                                                \
+        A_scale_transposed[OFFSET(ldg_k / 128, m_block_offset + m_warp_offset + mg * 8 + lane_id % 4 * 2, M)]);                                            \
+    }                                                                                                                                                      \
+    if constexpr (ldg_switch == LDG_ON_S_POST && rank < M_GROUP_PER_WARP) {                                                                                \
+      constexpr int mg      = rank;                                                                                                                        \
+      A_scale_reg[0][mg][0] = A_scale_reg[1][mg][0] * B_scale_reg;                                                                                         \
+      A_scale_reg[0][mg][1] = A_scale_reg[1][mg][1] * B_scale_reg;                                                                                         \
+    }                                                                                                                                                      \
+    if constexpr (cal_switch && rank < MxN_GROUP_PER_WARP) {                                                                                               \
+      constexpr int mg  = rank % M_GROUP_PER_WARP;                                                                                                         \
+      constexpr int ng  = rank / M_GROUP_PER_WARP;                                                                                                         \
+      constexpr int idx = rank % 2;                                                                                                                        \
+      mma_m16n8k32_row_col(C_mma_reg[idx], B_cal_reg[cal_reg_idx][ng].mma, A_cal_reg[cal_reg_idx][mg].mma, ZERO_ARR);                                      \
+    }                                                                                                                                                      \
+    if constexpr (cal_switch && rank > 0 && rank <= MxN_GROUP_PER_WARP) {                                                                                  \
+      constexpr int mg  = (rank - 1) % M_GROUP_PER_WARP;                                                                                                   \
+      constexpr int ng  = (rank - 1) / M_GROUP_PER_WARP;                                                                                                   \
+      constexpr int idx = (rank - 1) % 2;                                                                                                                  \
+      asm volatile("fma.rn.f32 %0, %1, %2, %3;"                                                                                                            \
+                   : "=f"(C_cal_reg[mg][ng][0])                                                                                                            \
+                   : "f"(C_mma_reg[idx][0]), "f"(A_scale_reg[0][mg][0]), "f"(C_cal_reg[mg][ng][0]));                                                       \
+      asm volatile("fma.rn.f32 %0, %1, %2, %3;"                                                                                                            \
+                   : "=f"(C_cal_reg[mg][ng][1])                                                                                                            \
+                   : "f"(C_mma_reg[idx][1]), "f"(A_scale_reg[0][mg][1]), "f"(C_cal_reg[mg][ng][1]));                                                       \
+      asm volatile("fma.rn.f32 %0, %1, %2, %3;"                                                                                                            \
+                   : "=f"(C_cal_reg[mg][ng][2])                                                                                                            \
+                   : "f"(C_mma_reg[idx][2]), "f"(A_scale_reg[0][mg][0]), "f"(C_cal_reg[mg][ng][2]));                                                       \
+      asm volatile("fma.rn.f32 %0, %1, %2, %3;"                                                                                                            \
+                   : "=f"(C_cal_reg[mg][ng][3])                                                                                                            \
+                   : "f"(C_mma_reg[idx][3]), "f"(A_scale_reg[0][mg][1]), "f"(C_cal_reg[mg][ng][3]));                                                       \
+    }                                                                                                                                                      \
+    if constexpr (rd_switch && rank < MxN_GROUP_PER_WARP) {                                                                                                \
+      constexpr int mg = rank % M_GROUP_PER_WARP;                                                                                                          \
+      constexpr int ng = rank / M_GROUP_PER_WARP;                                                                                                          \
+      if constexpr (mg == 0 && ng == 0) {                                                                                                                  \
+        max_val[mg] = fabs(C_cal_reg[mg][0][0]);                                                                                                           \
+      }                                                                                                                                                    \
+      LLMMM::shfl_1_and_0(C_cal_reg[mg][ng], 0x4, lane_id);                                                                                                \
+      LLMMM::shfl_3_and_2(C_cal_reg[mg][ng], 0x4, lane_id);                                                                                                \
+      LLMMM::shfl_23_and_01(C_cal_reg[mg][ng], 0x8, lane_id);                                                                                              \
+                                                                                                                                                           \
+      constexpr int array_size = get_array_size(C_cal_reg[0][0]);                                                                                          \
+      for (int i = 0; i < array_size; ++i) {                                                                                                               \
+        max_val[mg] = max_val[mg] > fabs(C_cal_reg[mg][ng][i]) ? max_val[mg] : fabs(C_cal_reg[mg][ng][i]);                                                 \
+      }                                                                                                                                                    \
+      max_val[mg] = max(max_val[mg], __shfl_xor_sync(0xffffffff, max_val[mg], 0x10));                                                                      \
+      max_val[mg] = max(max_val[mg], __shfl_xor_sync(0xffffffff, max_val[mg], 0x08));                                                                      \
+      if constexpr (ng == N_GROUP_PER_WARP - 1) {                                                                                                          \
+        if (lane_id < 8) {                                                                                                                                 \
+          const int m = mg * 8 + m_lane_offset[lane_id];                                                                                                   \
+          STORE_FLOAT(C_block_extrema[m_warp_id][m][n_warp_id], max_val[mg]);                                                                              \
+        }                                                                                                                                                  \
+      }                                                                                                                                                    \
+    }                                                                                                                                                      \
   }
 
-#define alternate(ldg_switch,                                                                                          \
-                  sts_switch,                                                                                          \
-                  ldm_switch,                                                                                          \
-                  cal_switch,                                                                                          \
-                  rd_switch,                                                                                           \
-                  ldg_k,                                                                                               \
-                  ldg_q_idx,                                                                                           \
-                  sts_sm_idx,                                                                                          \
-                  sts_reg_idx,                                                                                         \
-                  ldm_sm_idx,                                                                                          \
-                  ldm_reg_idx,                                                                                         \
-                  cal_reg_idx)                                                                                         \
+#define alternate(ldg_switch, cal_switch, rd_switch, ldg_k, ldg_q_idx, cal_reg_idx)                                    \
   {                                                                                                                    \
     constexpr int MxN_GROUP_PER_WARP = M_GROUP_PER_WARP * N_GROUP_PER_WARP;                                            \
     static_assert(MxN_GROUP_PER_WARP <= 32);                                                                           \
-    static_assert(M_LDG_PER_THREAD + N_LDG_PER_THREAD <= MxN_GROUP_PER_WARP);                                          \
-    /* clang-format off */ \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 0);             \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 1);             \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 2);             \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 3);             \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 4);             \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 5);             \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 6);             \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 7);             \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 8);             \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 9);             \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 10);            \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 11);            \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 12);            \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 13);            \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 14);            \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 15);            \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 16);            \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 17);            \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 18);            \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 19);            \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 20);            \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 21);            \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 22);            \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 23);            \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 24);            \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 25);            \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 26);            \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 27);            \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 28);            \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 29);            \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 30);            \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 31);            \
-    alternate__per_rank(ldg_switch, sts_switch, ldm_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (sts_sm_idx), (sts_reg_idx), (ldm_sm_idx), (ldm_reg_idx), (cal_reg_idx), 32);                                                                                           \
-    /* clang-format on */                                                                                              \
+    static_assert(M_GROUP_PER_WARP + N_GROUP_PER_WARP <= 32);                                                          \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 0);                    \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 1);                    \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 2);                    \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 3);                    \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 4);                    \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 5);                    \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 6);                    \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 7);                    \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 8);                    \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 9);                    \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 10);                   \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 11);                   \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 12);                   \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 13);                   \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 14);                   \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 15);                   \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 16);                   \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 17);                   \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 18);                   \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 19);                   \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 20);                   \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 21);                   \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 22);                   \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 23);                   \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 24);                   \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 25);                   \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 26);                   \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 27);                   \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 28);                   \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 29);                   \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 30);                   \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 31);                   \
+    alternate__per_rank(ldg_switch, cal_switch, rd_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 32);                   \
   }
 
   constexpr int IGN  = -1;
-  constexpr int IDX0 = 0, IDX1 = 1, IDX2 = 2, IDX3 = 3;
+  constexpr int IDX0 = 0, IDX1 = 1;
 
   {
-    alternate(LDG_ON_S, STS_OFF, LDM_OFF, CAL_OFF, RD_OFF, 0, IGN, IGN, IGN, IGN, IGN, IGN);
-
-    alternate(LDG_ON_Q, STS_OFF, LDM_OFF, CAL_OFF, RD_OFF, 0, IDX0, IGN, IGN, IGN, IGN, IGN);
-    alternate(LDG_ON_Q, STS_OFF, LDM_OFF, CAL_OFF, RD_OFF, 32, IDX1, IGN, IGN, IGN, IGN, IGN);
-
-    alternate(LDG_OFF, STS_ON, LDM_OFF, CAL_OFF, RD_OFF, IGN, IGN, IDX0, IDX0, IGN, IGN, IGN);
-    alternate(LDG_OFF, STS_ON, LDM_OFF, CAL_OFF, RD_OFF, IGN, IGN, IDX1, IDX1, IGN, IGN, IGN);
-
-    __syncthreads();
-
-    alternate(LDG_ON_S_POST, STS_OFF, LDM_OFF, CAL_OFF, RD_OFF, IGN, IGN, IGN, IGN, IGN, IGN, IGN);
+    alternate(LDG_ON_S, CAL_OFF, RD_OFF, 0, IGN, IGN);
+    alternate(LDG_ON_Q, CAL_OFF, RD_OFF, 0, IDX0, IGN);
+    alternate(LDG_ON_S_POST, CAL_OFF, RD_OFF, IGN, IGN, IGN);
   }
 
-  alternate(LDG_ON_Q, STS_OFF, LDM_OFF, CAL_OFF, RD_OFF, 64, IDX0, IGN, IGN, IGN, IGN, IGN);
-  alternate(LDG_ON_Q, STS_OFF, LDM_OFF, CAL_OFF, RD_OFF, 96, IDX1, IGN, IGN, IGN, IGN, IGN);
-
-  alternate(LDG_OFF, STS_OFF, LDM_ON, CAL_OFF, RD_OFF, IGN, IGN, IGN, IGN, IDX0, IDX0, IGN);
-
-  int k_block_offset = 128;
-
-  while (k_block_offset < K) {
-    alternate(LDG_ON_S, STS_OFF, LDM_OFF, CAL_OFF, RD_OFF, k_block_offset, IGN, IGN, IGN, IGN, IGN, IGN);
-
+  int k_block_offset = 0;
+  static_assert(LOOP_K == 128);
+  while (k_block_offset + 128 < K) {
+    alternate(LDG_ON_S, CAL_OFF, RD_OFF, k_block_offset + 128, IGN, IGN);
     {
-      alternate(LDG_OFF, STS_OFF, LDM_ON, CAL_OFF, RD_OFF, IGN, IGN, IGN, IGN, IDX1, IDX1, IGN);
-      alternate(LDG_OFF, STS_OFF, LDM_OFF, CAL_ON_FIRST, RD_OFF, IGN, IGN, IGN, IGN, IGN, IGN, IDX0);
+      k_block_offset += 32;
+      alternate(LDG_ON_Q, CAL_OFF, RD_OFF, k_block_offset, IDX1, IGN);
+      alternate(LDG_OFF, CAL_ON, RD_OFF, IGN, IGN, IDX0);
     }
     {
-      alternate(LDG_OFF, STS_OFF, LDM_OFF, CAL_ON_MIDDLE, RD_OFF, IGN, IGN, IGN, IGN, IGN, IGN, IDX1);
-      alternate(LDG_OFF, STS_ON, LDM_OFF, CAL_OFF, RD_OFF, IGN, IGN, IDX2, IDX0, IGN, IGN, IGN);
-      alternate(LDG_OFF, STS_ON, LDM_OFF, CAL_OFF, RD_OFF, IGN, IGN, IDX3, IDX1, IGN, IGN, IGN);
-      __syncthreads();
-      alternate(LDG_OFF, STS_OFF, LDM_ON, CAL_OFF, RD_OFF, IGN, IGN, IGN, IGN, IDX2, IDX0, IGN);
-      alternate(LDG_ON_Q, STS_OFF, LDM_OFF, CAL_OFF, RD_OFF, k_block_offset, IDX0, IGN, IGN, IGN, IGN, IGN);
-      k_block_offset += PARTIAL_LOOP_K;
-      alternate(LDG_ON_Q, STS_OFF, LDM_OFF, CAL_OFF, RD_OFF, k_block_offset, IDX1, IGN, IGN, IGN, IGN, IGN);
-      k_block_offset += PARTIAL_LOOP_K;
+      k_block_offset += 32;
+      alternate(LDG_ON_Q, CAL_OFF, RD_OFF, k_block_offset, IDX0, IGN);
+      alternate(LDG_OFF, CAL_ON, RD_OFF, IGN, IGN, IDX1);
     }
     {
-      alternate(LDG_OFF, STS_OFF, LDM_ON, CAL_OFF, RD_OFF, IGN, IGN, IGN, IGN, IDX3, IDX1, IGN);
-      alternate(LDG_OFF, STS_OFF, LDM_OFF, CAL_ON_MIDDLE, RD_OFF, IGN, IGN, IGN, IGN, IGN, IGN, IDX0);
+      k_block_offset += 32;
+      alternate(LDG_ON_Q, CAL_OFF, RD_OFF, k_block_offset, IDX1, IGN);
+      alternate(LDG_OFF, CAL_ON, RD_OFF, IGN, IGN, IDX0);
     }
     {
-      alternate(LDG_OFF, STS_OFF, LDM_OFF, CAL_ON_LAST, RD_OFF, IGN, IGN, IGN, IGN, IGN, IGN, IDX1);
-      alternate(LDG_OFF, STS_ON, LDM_OFF, CAL_OFF, RD_OFF, IGN, IGN, IDX0, IDX0, IGN, IGN, IGN);
-      alternate(LDG_OFF, STS_ON, LDM_OFF, CAL_OFF, RD_OFF, IGN, IGN, IDX1, IDX1, IGN, IGN, IGN);
-      __syncthreads();
-      alternate(LDG_OFF, STS_OFF, LDM_ON, CAL_OFF, RD_OFF, IGN, IGN, IGN, IGN, IDX0, IDX0, IGN);
-      alternate(LDG_ON_Q, STS_OFF, LDM_OFF, CAL_OFF, RD_OFF, k_block_offset, IDX0, IGN, IGN, IGN, IGN, IGN);
-      k_block_offset += PARTIAL_LOOP_K;
-      alternate(LDG_ON_Q, STS_OFF, LDM_OFF, CAL_OFF, RD_OFF, k_block_offset, IDX1, IGN, IGN, IGN, IGN, IGN);
-      k_block_offset += PARTIAL_LOOP_K;
+      k_block_offset += 32;
+      alternate(LDG_ON_Q, CAL_OFF, RD_OFF, k_block_offset, IDX0, IGN);
+      alternate(LDG_OFF, CAL_ON, RD_OFF, IGN, IGN, IDX1);
     }
-
-    alternate(LDG_ON_S_POST, STS_OFF, LDM_OFF, CAL_OFF, RD_OFF, IGN, IGN, IGN, IGN, IGN, IGN, IGN);
+    alternate(LDG_ON_S_POST, CAL_OFF, RD_OFF, IGN, IGN, IGN);
   }
   {
     {
-      alternate(LDG_OFF, STS_OFF, LDM_ON, CAL_OFF, RD_OFF, IGN, IGN, IGN, IGN, IDX1, IDX1, IGN);
-      alternate(LDG_OFF, STS_OFF, LDM_OFF, CAL_ON_FIRST, RD_OFF, IGN, IGN, IGN, IGN, IGN, IGN, IDX0);
+      k_block_offset += 32;
+      alternate(LDG_ON_Q, CAL_OFF, RD_OFF, k_block_offset, IDX1, IGN);
+      alternate(LDG_OFF, CAL_ON, RD_OFF, IGN, IGN, IDX0);
     }
     {
-      alternate(LDG_OFF, STS_ON, LDM_OFF, CAL_OFF, RD_OFF, IGN, IGN, IDX2, IDX0, IGN, IGN, IGN);
-      alternate(LDG_OFF, STS_ON, LDM_OFF, CAL_OFF, RD_OFF, IGN, IGN, IDX3, IDX1, IGN, IGN, IGN);
-      alternate(LDG_OFF, STS_OFF, LDM_OFF, CAL_ON_MIDDLE, RD_OFF, IGN, IGN, IGN, IGN, IGN, IGN, IDX1);
-      __syncthreads();
-      alternate(LDG_OFF, STS_OFF, LDM_ON, CAL_OFF, RD_OFF, IGN, IGN, IGN, IGN, IDX2, IDX0, IGN);
+      k_block_offset += 32;
+      alternate(LDG_ON_Q, CAL_OFF, RD_OFF, k_block_offset, IDX0, IGN);
+      alternate(LDG_OFF, CAL_ON, RD_OFF, IGN, IGN, IDX1);
     }
     {
-      alternate(LDG_OFF, STS_OFF, LDM_ON, CAL_OFF, RD_OFF, IGN, IGN, IGN, IGN, IDX3, IDX1, IGN);
-      alternate(LDG_OFF, STS_OFF, LDM_OFF, CAL_ON_MIDDLE, RD_OFF, IGN, IGN, IGN, IGN, IGN, IGN, IDX0);
+      k_block_offset += 32;
+      alternate(LDG_ON_Q, CAL_OFF, RD_OFF, k_block_offset, IDX1, IGN);
+      alternate(LDG_OFF, CAL_ON, RD_OFF, IGN, IGN, IDX0);
     }
     {
-      alternate(LDG_OFF, STS_OFF, LDM_OFF, CAL_ON_LAST, RD_OFF, IGN, IGN, IGN, IGN, IGN, IGN, IDX1);
+      alternate(LDG_OFF, CAL_ON, RD_OFF, IGN, IGN, IDX1);
     }
   }
 
-  alternate(LDG_OFF, STS_OFF, LDM_OFF, CAL_OFF, RD_ON, IGN, IGN, IGN, IGN, IGN, IGN, IGN);
+  alternate(LDG_OFF, CAL_OFF, RD_ON, IGN, IGN, IGN);
 
   __syncthreads();
 
@@ -556,28 +436,11 @@ __global__ void fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8
 
   constexpr float fp8_e4m3_range = 448;
 
-  // for (int mg = 0; mg < M_GROUP_PER_WARP; ++mg) {
-  //   const float scale_inv = fp8_e4m3_range / max_val[mg];
-  //   const float scale     = max_val[mg] / fp8_e4m3_range;
-  //   const int   m_global  = m_block_offset + m_warp_offset + mg * 8 + m_lane_offset[lane_id % 8];
-  //   for (int ng = 0; ng < N_GROUP_PER_WARP; ++ng) {
-  //     const int n_global = n_block_offset + n_warp_offset + ng * 16 + n_lane_offset[lane_id / 8];
-  //     fp8_t     q[4]     = {fp8_t(C_cal_reg[mg][ng][0] * scale_inv),
-  //                           fp8_t(C_cal_reg[mg][ng][1] * scale_inv),
-  //                           fp8_t(C_cal_reg[mg][ng][2] * scale_inv),
-  //                           fp8_t(C_cal_reg[mg][ng][3] * scale_inv)};
-  //     STORE_FLOAT(C[OFFSET(m_global, n_global, N)], q);
-  //   }
-  //   if (lane_id < 8) {
-  //     static_assert(BLOCK_N <= 128);
-  //     STORE_FLOAT(C_scale_transposed[OFFSET(n_block_offset / 128, m_global, M)], scale);
-  //   }
-  // }
   for (int mg = 0; mg < M_GROUP_PER_WARP; ++mg) {
     const float scale_inv = fp8_e4m3_range / max_val[mg];
     const float scale     = max_val[mg] / fp8_e4m3_range;
     const int   m_global  = m_block_offset + m_warp_offset + mg * 8 + m_lane_offset[lane_id % 8];
-    static_assert(N_GROUP_PER_WARP % 2  == 0);
+    static_assert(N_GROUP_PER_WARP % 2 == 0);
     for (int ng = 0; ng < N_GROUP_PER_WARP; ng += 2) {
       const int n_global = n_block_offset + n_warp_offset + ng * 16 + lane_id / 8 * 8;
       fp8_t     q[8]     = {
@@ -648,7 +511,7 @@ int main()
 
   std::vector<float>                    h_A(M * K), h_B(K * N), h_C(M * N);
   std::random_device                    rd;
-  std::mt19937                          gen(rd());
+  std::mt19937                          gen(0);
   std::uniform_real_distribution<float> dis(-5, 5);
   for (auto& vec : {&h_A, &h_B}) {
 #if 1
@@ -786,20 +649,6 @@ int main()
       error_m,
       error_k);
   }
-  // {
-  //   printf("A_q\n");
-  //   for (int m = 0; m < M && m < 128; ++m) {
-  //     for (int k = 0; k < K && k < 128; ++k) {
-  //       printf("%10.3f(%10.3f) ", float(h_A_q[m * K + k]), h_A[m * K + k]);
-  //     }
-  //     printf("\n");
-  //   }
-  //   printf("A_s\n");
-  //   for (int m = 0; m < 128; ++m) {
-  //     printf("%10.8f ", float(h_A_s[m]));
-  //   }
-  //   printf("\n");
-  // }
 
   fp8_blockwise_symmetric_quantization<128, 128, false>(d_B_transposed, d_B_q, d_B_s, K, N, nullptr);
   CHECK_CUDA_ERROR();
@@ -840,9 +689,98 @@ int main()
       error_k);
   }
 
+  std::vector<__nv_fp8_e4m3> h_A_q_constructed(M * K);
+  __nv_fp8_e4m3*             d_A_q_constructed;
+
+  std::vector<__nv_fp8_e4m3> h_B_q_constructed(N * K);
+  __nv_fp8_e4m3*             d_B_q_constructed;
+
+  CHECK_CUDA_RETURN(cudaMalloc(&d_A_q_constructed, sizeof(__nv_fp8_e4m3) * M * K));
+  CHECK_CUDA_RETURN(cudaMalloc(&d_B_q_constructed, sizeof(__nv_fp8_e4m3) * N * K));
+
+  construct_m16n8k32_B_layout(d_A_q_constructed, d_A_q, M, K, nullptr);
+  CHECK_CUDA_ERROR();
+  CHECK_CUDA_RETURN(
+    cudaMemcpy(h_A_q_constructed.data(), d_A_q_constructed, sizeof(__nv_fp8_e4m3) * M * K, cudaMemcpyDefault));
+  {
+    int error = 0;
+    for (int m = 0; m < M; ++m) {
+      for (int k = 0; k < K; ++k) {
+        float         base                         = float(h_A_q[OFFSET(m, k, K)]);
+        int           construct_k                  = k % 32;
+        constexpr int construct_k_group_mapping[8] = {0, 2, 4, 6, 1, 3, 5, 7};
+        construct_k                                = construct_k_group_mapping[construct_k / 4] * 4 + construct_k % 4;
+        float exp                                  = float(h_A_q_constructed[OFFSET(m, k / 32 * 32 + construct_k, K)]);
+        if (base != exp) {
+          error++;
+        }
+      }
+    }
+    printf("check construct_m16n8k32_B_layout, total = %10d, error = %10d\n", M * K, error);
+    // printf("construct_m16n8k32_B_layout, base\n");
+    // for (int m = 0; m < M && m < 8; ++m) {
+    //   for (int k = 0; k < K && k < 32; ++k) {
+    //     printf("%10.3f(%03d, %03d) ", float(h_A_q[OFFSET(m, k, K)]), m, k);
+    //     if ((k + 1) % 8 == 0) {
+    //       printf("\n");
+    //     }
+    //   }
+    // }
+    // printf("construct_m16n8k32_B_layout, exp\n");
+    // for (int m = 0; m < M && m < 8; ++m) {
+    //   for (int k = 0; k < K && k < 32; ++k) {
+    //     printf("%10.3f(%03d, %03d) ", float(h_A_q_constructed[OFFSET(m, k, K)]), m, k);
+    //     if ((k + 1) % 8 == 0) {
+    //       printf("\n");
+    //     }
+    //   }
+    // }
+  }
+  construct_m16n8k32_A_layout(d_B_q_constructed, d_B_q, N, K, nullptr);
+  CHECK_CUDA_ERROR();
+  CHECK_CUDA_RETURN(
+    cudaMemcpy(h_B_q_constructed.data(), d_B_q_constructed, sizeof(__nv_fp8_e4m3) * N * K, cudaMemcpyDefault));
+  {
+    int error = 0;
+    for (int n = 0; n < N; ++n) {
+      for (int k = 0; k < K; ++k) {
+        float         base                   = float(h_B_q[OFFSET(n, k, K)]);
+        constexpr int construct_n_mapping[4] = {0, 8, 0, 8};
+        constexpr int construct_k_mapping[4] = {0, 0, 16, 16};
+
+        int cn = n / 16 * 16 + construct_n_mapping[k % 16 / 4] + n % 8;
+        int ck =
+          k / 32 * 32 + construct_k_mapping[k % 16 / 4] + (((n % 16) < 8) ? 0 : 4) + (((k % 32) < 16) ? 0 : 8) + k % 4;
+        float exp = float(h_B_q_constructed[OFFSET(cn, ck, K)]);
+        if (base != exp) {
+          error++;
+        }
+      }
+    }
+    printf("check construct_m16n8k32_A_layout, total = %10d, error = %10d\n", N * K, error);
+    // printf("construct_m16n8k32_A_layout, base\n");
+    // for (int n = 0; n < N && n < 16; ++n) {
+    //   for (int k = 0; k < K && k < 32; ++k) {
+    //     printf("%10.3f(%03d, %03d) ", float(h_B_q[OFFSET(n, k, K)]), n, k);
+    //     if ((k + 1) % 8 == 0) {
+    //       printf("\n");
+    //     }
+    //   }
+    // }
+    // printf("construct_m16n8k32_A_layout, exp\n");
+    // for (int n = 0; n < N && n < 16; ++n) {
+    //   for (int k = 0; k < K && k < 32; ++k) {
+    //     printf("%10.3f(%03d, %03d) ", float(h_B_q_constructed[OFFSET(n, k, K)]), n, k);
+    //     if ((k + 1) % 8 == 0) {
+    //       printf("\n");
+    //     }
+    //   }
+    // }
+  }
+
 #define check(function)                                                                                                                                                                    \
   CHECK_CUDA_RETURN(cudaMemset(d_C_q, 0, sizeof(__nv_fp8_e4m3) * h_C_q.size()));                                                                                                           \
-  function(d_A_q, d_A_s, d_B_q, d_B_s, d_C_q, d_C_s, M, N, K, nullptr);                                                                                                                    \
+  function(d_A_q_constructed, d_A_s, d_B_q_constructed, d_B_s, d_C_q, d_C_s, M, N, K, nullptr);                                                                                            \
   CHECK_CUDA_ERROR_WITH_INFO(#function);                                                                                                                                                   \
   CHECK_CUDA_RETURN(cudaMemcpy(h_C_q.data(), d_C_q, sizeof(__nv_fp8_e4m3) * h_C_q.size(), cudaMemcpyDefault));                                                                             \
   CHECK_CUDA_RETURN(cudaMemcpy(h_C_s.data(), d_C_s, sizeof(float) * h_C_s.size(), cudaMemcpyDefault));                                                                                     \
@@ -852,8 +790,8 @@ int main()
     int   error_m, error_n;                                                                                                                                                                \
     float sum_abs_error = 0;                                                                                                                                                               \
     float sum_abs_value = 0;                                                                                                                                                               \
-    for (int m = 0; m < M; ++m) {                                                                                                                                                          \
-      for (int n = 0; n < N; ++n) {                                                                                                                                                        \
+    for (int m = 0; m < M && m < 16; ++m) {                                                                                                                                                \
+      for (int n = 0; n < N && n < 8; ++n) {                                                                                                                                               \
         float s    = h_C_s[n / 128 * M + m];                                                                                                                                               \
         float q    = float(h_C_q[m * N + n]);                                                                                                                                              \
         float deq  = q * s;                                                                                                                                                                \
@@ -883,6 +821,21 @@ int main()
       exp_s,                                                                                                                                                                               \
       error_m,                                                                                                                                                                             \
       error_n);                                                                                                                                                                            \
+    /* printf("function = %s, base\n", #function);*/                                                                                                                                       \
+    /* for (int m = 0; m < M && m < 16; ++m) {    */                                                                                                                                       \
+    /*   for (int n = 0; n < N && n < 8; ++n) {   */                                                                                                                                       \
+    /*     printf("%8.3f ", h_C[m * N + n]);      */                                                                                                                                       \
+    /*   }                                        */                                                                                                                                       \
+    /*   printf("\n");                            */                                                                                                                                       \
+    /* }                                          */                                                                                                                                       \
+    /* printf("function = %s, q\n", #function);   */                                                                                                                                       \
+    /* for (int m = 0; m < M && m < 16; ++m) {    */                                                                                                                                       \
+    /*   for (int n = 0; n < N && n < 8; ++n) {   */                                                                                                                                       \
+    /*     float q = float(h_C_q[m * N + n]);     */                                                                                                                                       \
+    /*     printf("%8.3f ", q);                   */                                                                                                                                       \
+    /*   }                                        */                                                                                                                                       \
+    /*   printf("\n");                            */                                                                                                                                       \
+    /* }                                          */                                                                                                                                       \
   }
 
   check(fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8__quadra_buffer__no_sm);
@@ -897,5 +850,7 @@ int main()
   CHECK_CUDA_RETURN(cudaFree(d_A_q));
   CHECK_CUDA_RETURN(cudaFree(d_B_q));
   CHECK_CUDA_RETURN(cudaFree(d_C_q));
+  CHECK_CUDA_RETURN(cudaFree(d_A_q_constructed));
+  CHECK_CUDA_RETURN(cudaFree(d_B_q_constructed));
   return 0;
 }

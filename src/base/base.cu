@@ -2,6 +2,7 @@
 #include "util/macro.h"
 #include "util/util.cuh"
 #include <cuda_fp8.h>
+#include <stdexcept>
 
 namespace LLMMM {
 
@@ -152,4 +153,123 @@ void transpose_matrix__aligned_128(T* dst, T* src, int M, int N, cudaStream_t st
 
 template void transpose_matrix__aligned_128(__nv_fp8_e4m3* dst, __nv_fp8_e4m3* src, int M, int N, cudaStream_t stream);
 template void transpose_matrix__aligned_128(float* dst, float* src, int M, int N, cudaStream_t stream);
+
+template<int BLOCK_M, int BLOCK_K>
+__global__ void construct_m16n8k32_A_layout(__nv_fp8_e4m3* dst, const __nv_fp8_e4m3* src, int M, int K)
+{
+  constexpr int WARP_COUNT = 4;
+  static_assert(WARP_COUNT * 32 == BLOCK_K);
+  const int lane_id = threadIdx.x % 32;
+  const int warp_id = threadIdx.x / 32;
+
+  const int m_block_offset = blockIdx.y * BLOCK_M;
+  const int k_block_offset = blockIdx.x * BLOCK_K;
+  const int k_warp_offset  = warp_id * 32;
+  /* Thread Layout. Each thread reads 16 consecutive fp8 along the K dimension.*/
+  /* M ↓, K → */
+  /* T00 T02 */
+  /* T04 T06 */
+  /* T08 T10 */
+  /* T12 T14 */
+  /* T16 T18 */
+  /* T20 T22 */
+  /* T24 T26 */
+  /* T28 T30 */
+  /* T01 T03 */
+  /* T05 T07 */
+  /* T09 T11 */
+  /* T13 T15 */
+  /* T17 T19 */
+  /* T21 T23 */
+  /* T25 T27 */
+  /* T29 T31 */
+  const int m_lane_offset = lane_id / 4 + (lane_id & 0x1) * 8;
+  const int k_lane_offset = lane_id % 4 / 2 * 16;
+
+  float reg[4];
+
+  constexpr int    LANE_GROUP_COUNT = 32 / 4;
+  __shared__ float sm[WARP_COUNT][4][LANE_GROUP_COUNT][4];
+
+  for (int m_loop_offset = 0; m_loop_offset < BLOCK_M; m_loop_offset += 16) {
+    const int m_global = m_block_offset + m_loop_offset + m_lane_offset;
+    const int k_global = k_block_offset + k_warp_offset + k_lane_offset;
+    FETCH_FLOAT4(reg, src[OFFSET(m_global, k_global, K)]);
+    STORE_FLOAT(sm[warp_id][0][lane_id / 4][lane_id % 4], reg[0]);
+    STORE_FLOAT(sm[warp_id][1][lane_id / 4][lane_id % 4], reg[1]);
+    STORE_FLOAT(sm[warp_id][2][lane_id / 4][lane_id % 4], reg[2]);
+    STORE_FLOAT(sm[warp_id][3][lane_id / 4][lane_id % 4], reg[3]);
+    FETCH_FLOAT4(reg, sm[warp_id][lane_id % 4][lane_id / 4]);
+    STORE_FLOAT4(dst[OFFSET(m_global, k_global, K)], reg);
+  }
+}
+
+void construct_m16n8k32_A_layout(__nv_fp8_e4m3* dst, const __nv_fp8_e4m3* src, int M, int K, cudaStream_t stream)
+{
+  constexpr int BLOCK_M = 128;
+  constexpr int BLOCK_K = 128;
+  if (K % BLOCK_K != 0) {
+    throw std::runtime_error("K must be greater than 0 and divisible by 128.");
+  }
+  if (M % 16 != 0) {
+    throw std::runtime_error("M must be greater than 0 and divisible by 16.");
+  }
+  dim3 grid(K / BLOCK_K, (M + BLOCK_M - 1) / BLOCK_M);
+  dim3 block(128);
+  construct_m16n8k32_A_layout<BLOCK_M, BLOCK_K><<<grid, block, 0, stream>>>(dst, src, M, K);
+}
+
+template<int BLOCK_N, int BLOCK_K>
+__global__ void construct_m16n8k32_B_layout(__nv_fp8_e4m3* dst, const __nv_fp8_e4m3* src_tranposed, int N, int K)
+{
+  constexpr int WARP_COUNT = 4;
+  static_assert(WARP_COUNT * 32 == BLOCK_K);
+  const int warp_id = threadIdx.x / 32;
+  const int lane_id = threadIdx.x % 32;
+
+  const int n_block_offset = blockIdx.x * BLOCK_N;
+  const int k_block_offset = blockIdx.y * BLOCK_K;
+  const int k_warp_offset  = warp_id * 32;
+  const int n_lane_offset  = lane_id / 4;
+  const int k_lane_offset  = lane_id % 4 * 8;
+
+  /* Thread Layout. Each thread reads 8 consecutive fp8 along the K dimension.*/
+  /* N ↓, K → */
+  /* T00 T01 T02 T03 */
+  /* T04 T05 T06 T07 */
+  /* T08 T09 T10 T11 */
+  /* T12 T13 T14 T15 */
+  /* T16 T17 T18 T19 */
+  /* T20 T21 T22 T23 */
+  /* T24 T25 T26 T27 */
+  /* T28 T29 T30 T31 */
+  float            reg[2];
+  __shared__ float sm[WARP_COUNT][8][8];
+  for (int n_loop_offset = 0; n_loop_offset < BLOCK_N; n_loop_offset += 8) {
+    const int n_global = n_block_offset + n_loop_offset + n_lane_offset;
+    const int k_global = k_block_offset + k_warp_offset + k_lane_offset;
+    if (n_global < N) {
+      FETCH_FLOAT2(reg, src_tranposed[OFFSET(n_global, k_global, K)]);
+      STORE_FLOAT2(sm[warp_id][lane_id / 4][lane_id % 4 * 2], reg);
+      constexpr int position_mapping[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+      FETCH_FLOAT(reg[0], sm[warp_id][lane_id / 4][position_mapping[lane_id % 4 * 2]]);
+      FETCH_FLOAT(reg[1], sm[warp_id][lane_id / 4][position_mapping[lane_id % 4 * 2 + 1]]);
+      STORE_FLOAT2(dst[OFFSET(n_global, k_global, K)], reg);
+    }
+  }
+}
+
+void construct_m16n8k32_B_layout(
+  __nv_fp8_e4m3* dst, const __nv_fp8_e4m3* src_tranposed, int N, int K, cudaStream_t stream)
+{
+  constexpr int BLOCK_K = 128;
+  constexpr int BLOCK_N = 128;
+  if (K % BLOCK_K != 0) {
+    throw std::runtime_error("K must be greater than 0 and divisible by 128.");
+  }
+  dim3 grid((N + BLOCK_N - 1) / BLOCK_N, K / BLOCK_K);
+  dim3 block(128);
+  construct_m16n8k32_B_layout<BLOCK_N, BLOCK_K><<<grid, block, 0, stream>>>(dst, src_tranposed, N, K);
+}
+
 }  // namespace LLMMM
