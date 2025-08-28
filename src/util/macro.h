@@ -53,6 +53,8 @@
 
 #define FETCH_FLOAT4_WITH_PTR(dst, src) *(float4*)(dst) = *(const float4*)(src)
 
+#define FETCH_FLOAT4_WITH_SRC_PTR(dst, src) *(float4*)(&dst) = *(const float4*)(src)
+
 #define FETCH_FLOAT4_PREFETCH_256B_WITH_SRC_PTR(dst, src)                                                              \
   {                                                                                                                    \
     asm volatile("ld.global.L2::256B.v4.f32 {%0, %1, %2, %3}, [%4];"                                                   \
