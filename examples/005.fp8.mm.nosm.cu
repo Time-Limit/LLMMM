@@ -737,45 +737,349 @@ fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8__quadra_buffer_
 #undef alternate__per_rank
 }
 
-#define launch_128x128_64x64(function)                                                                                 \
-  void function(const __nv_fp8_e4m3* A,                                                                                \
-                const float*         A_scale_transposed,                                                               \
-                const __nv_fp8_e4m3* B_transposed,                                                                     \
-                const float*         B_scale_transposed,                                                               \
-                __nv_fp8_e4m3*       C,                                                                                \
-                float*               C_scale_transposed,                                                               \
-                int                  M,                                                                                \
-                int                  N,                                                                                \
-                int                  K,                                                                                \
-                cudaStream_t         stream)                                                                           \
+template<int BLOCK_M, int BLOCK_N, int WARP_M, int WARP_N, int LOOP_K>
+__global__ void
+fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8__quadra_buffer__no_sm__B_Q_single_buffer__memcpy_async(
+  const __nv_fp8_e4m3* A,
+  const float*         A_scale_transposed,
+  const __nv_fp8_e4m3* B_transposed,
+  const float*         B_scale_transposed,
+  __nv_fp8_e4m3*       C,
+  float*               C_scale_transposed,
+  int                  M,
+  int                  N,
+  int                  K)
+{
+  constexpr int M_WARP_COUNT     = BLOCK_M / WARP_M;
+  constexpr int N_WARP_COUNT     = BLOCK_N / WARP_N;
+  constexpr int WARP_COUNT       = M_WARP_COUNT * N_WARP_COUNT;
+  constexpr int M_GROUP_PER_WARP = WARP_M / 8;
+  constexpr int N_GROUP_PER_WARP = WARP_N / 16;
+
+  using fp8_t = __nv_fp8_e4m3;
+
+  const int warp_id        = threadIdx.x / 32;
+  const int lane_id        = threadIdx.x % 32;
+  const int m_block_offset = BLOCK_M * blockIdx.y;
+  const int n_block_offset = BLOCK_N * blockIdx.x;
+  const int m_warp_id      = warp_id % M_WARP_COUNT;
+  const int n_warp_id      = warp_id / M_WARP_COUNT;
+  const int m_warp_offset  = m_warp_id * WARP_M;
+  const int n_warp_offset  = n_warp_id * WARP_N;
+
+  // LDG
+  constexpr int    LDG_S_REG_BUFFER_SIZE = 2;
+  float            A_scale_reg[LDG_S_REG_BUFFER_SIZE][M_GROUP_PER_WARP][2];  // A_scale_transposed is (K/128) x M
+  float            B_scale_reg;                                              // B_scale_transposed is (N/128) x (K/128)
+  constexpr int LANE_COUNT = 32;
+  __shared__ float A_scale_sm[M_GROUP_PER_WARP][WARP_COUNT][LANE_COUNT][2];
+
+  constexpr int CAL_BUFFER_SIZE = 2;
+  // MMA
+  union {
+    float ldg[2];
+    fp8_t mma[8];
+  } A_cal_reg[CAL_BUFFER_SIZE][M_GROUP_PER_WARP];
+
+  union {
+    float ldg[4];
+    fp8_t mma[16];
+  } B_cal_reg[N_GROUP_PER_WARP];
+
+  float           C_mma_reg[M_GROUP_PER_WARP][N_GROUP_PER_WARP][4] = {0};
+  float           C_cal_reg[M_GROUP_PER_WARP][N_GROUP_PER_WARP][4] = {0};
+  constexpr float ZERO_ARR[4]                                      = {0, 0, 0, 0};
+
+  enum {
+    LDG_OFF = 0,
+    LDG_ON_Q_A,
+    LDG_ON_Q_B,
+    LDG_ON_S,
+    LDG_ON_S_POST,
+  };
+
+  enum {
+    CAL_OFF = 0,
+    CAL_ON,
+  };
+
+  const fp8_t* A_partial_ptr[M_GROUP_PER_WARP];
+  for (int mg = 0; mg < M_GROUP_PER_WARP; ++mg) {
+    A_partial_ptr[mg] = &A[(m_block_offset + m_warp_offset + mg * 8 + lane_id / 4) * K + lane_id % 4 * 8];
+  }
+  const fp8_t* B_parital_ptr[N_GROUP_PER_WARP];
+  for (int ng = 0; ng < N_GROUP_PER_WARP; ++ng) {
+    B_parital_ptr[ng] = &B_transposed[(n_block_offset + n_warp_offset + ng * 16 + lane_id / 4 + (lane_id & 0x1) * 8) * K
+                                      + lane_id % 4 / 2 * 16];
+  }
+
+  const float* B_scale_partial_ptr = &B_scale_transposed[(n_block_offset / 128) * (K / 128)];
+
+  const float* A_scale_partial_ptr[M_GROUP_PER_WARP];
+  for (int mg = 0; mg < M_GROUP_PER_WARP; ++mg) {
+    A_scale_partial_ptr[mg] = &A_scale_transposed[m_block_offset + m_warp_offset + mg * 8 + lane_id % 4 * 2];
+}
+
+#define alternate__per_rank(ldg_switch, cal_switch, ldg_k, ldg_q_idx, cal_reg_idx, rank)                               \
+{                                                                                                                      \
+  if constexpr (cal_switch && rank > 0 && rank <= MxN_GROUP_PER_WARP) {                                                \
+    constexpr int mg = (rank - 1) % M_GROUP_PER_WARP;                                                                  \
+    constexpr int ng = (rank - 1) / M_GROUP_PER_WARP;                                                                  \
+    C_cal_reg[mg][ng][0] += C_mma_reg[mg][ng][0] * A_scale_reg[0][mg][0];                                              \
+    C_cal_reg[mg][ng][1] += C_mma_reg[mg][ng][1] * A_scale_reg[0][mg][1];                                              \
+    C_cal_reg[mg][ng][2] += C_mma_reg[mg][ng][2] * A_scale_reg[0][mg][0];                                              \
+    C_cal_reg[mg][ng][3] += C_mma_reg[mg][ng][3] * A_scale_reg[0][mg][1];                                              \
+  }                                                                                                                    \
+  if constexpr (cal_switch && rank < MxN_GROUP_PER_WARP) {                                                             \
+    constexpr int mg = rank % M_GROUP_PER_WARP;                                                                        \
+    constexpr int ng = rank / M_GROUP_PER_WARP;                                                                        \
+    mma_m16n8k32_row_col(C_mma_reg[mg][ng], B_cal_reg[ng].mma, A_cal_reg[cal_reg_idx][mg].mma, ZERO_ARR);              \
+  }                                                                                                                    \
+  if constexpr (ldg_switch == LDG_ON_Q_A && rank < M_GROUP_PER_WARP) {                                                 \
+    constexpr int m_group = rank;                                                                                      \
+    /* constexpr int m_group_offset = m_group * 8;                                                      */             \
+    /* const int     m_lane_offset  = lane_id / 4;                                                      */             \
+    /* const int     k_lane_offset  = lane_id % 4 * 8;                                                  */             \
+    /* const int     m_global       = m_block_offset + m_warp_offset + m_group_offset + m_lane_offset;  */             \
+    /* const int     k_global       = k_lane_offset + ldg_k;                                            */             \
+    FETCH_FLOAT2_WITH_SRC_PTR(A_cal_reg[ldg_q_idx][m_group].ldg, A_partial_ptr[m_group] + ldg_k);                      \
+  }                                                                                                                    \
+  if constexpr (ldg_switch == LDG_ON_Q_B && rank <= MxN_GROUP_PER_WARP && rank % M_GROUP_PER_WARP == 0                 \
+                && rank / M_GROUP_PER_WARP > 0) {                                                                      \
+    constexpr int n_group = rank / M_GROUP_PER_WARP - 1;                                                               \
+    /* constexpr int n_group_offset = n_group * 16;                                                       */           \
+    /* const int     n_lane_offset  = lane_id / 4 + (lane_id & 0x1) * 8;                                  */           \
+    /* const int     k_lane_offset  = lane_id % 4 / 2 * 16;                                               */           \
+    /* const int     n_global       = n_block_offset + n_warp_offset + n_group_offset + n_lane_offset;    */           \
+    /* const int     k_global       = k_lane_offset + ldg_k;                                              */           \
+    FETCH_FLOAT4_WITH_SRC_PTR(B_cal_reg[n_group].ldg, B_parital_ptr[n_group] + ldg_k);                                 \
+  }                                                                                                                    \
+  if constexpr (ldg_switch == LDG_ON_S && rank == 0) {                                                                 \
+    FETCH_FLOAT(B_scale_reg, *(B_scale_partial_ptr + ldg_k / 128));                                                    \
+  }                                                                                                                    \
+  if constexpr (ldg_switch == LDG_ON_S && rank < M_GROUP_PER_WARP) {                                                   \
+    constexpr int mg = rank;                                                                                           \
+    /* FETCH_FLOAT2_WITH_SRC_PTR(A_scale_reg[1][mg], A_scale_partial_ptr[mg] + ldg_k / 128 * M); */                    \
+    __pipeline_memcpy_async(                                                                                           \
+      &A_scale_sm[mg][warp_id][lane_id][0], A_scale_partial_ptr[mg] + ldg_k / 128 * M, sizeof(float) * 2, 0);          \
+    __pipeline_commit();                                                                                               \
+  }                                                                                                                    \
+  if constexpr (ldg_switch == LDG_ON_S_POST && rank < M_GROUP_PER_WARP) {                                              \
+    __pipeline_wait_prior(0);                                                                                          \
+    constexpr int mg = rank;                                                                                           \
+    FETCH_FLOAT2(A_scale_reg[1][mg][0], A_scale_sm[mg][warp_id][lane_id][0]);                                          \
+    A_scale_reg[0][mg][0] = A_scale_reg[1][mg][0] * B_scale_reg;                                                       \
+    A_scale_reg[0][mg][1] = A_scale_reg[1][mg][1] * B_scale_reg;                                                       \
+  }                                                                                                                    \
+}
+
+#define alternate(ldg_switch, cal_switch, ldg_k, ldg_q_idx, cal_reg_idx)                                               \
   {                                                                                                                    \
-    constexpr int BLOCK_M = 128;                                                                                       \
-    constexpr int BLOCK_N = 128;                                                                                       \
-    constexpr int LOOP_K  = 128;                                                                                       \
-    constexpr int WARP_M  = 64;                                                                                        \
-    constexpr int WARP_N  = 64;                                                                                        \
-    static_assert(BLOCK_M > 0 && BLOCK_M <= 128 && BLOCK_M % WARP_M == 0);                                             \
-    static_assert(BLOCK_N == 128 && BLOCK_N % WARP_N == 0);                                                            \
-    static_assert(WARP_M > 0 && WARP_M % 8 == 0); /* mma.m16n8k32.row.col, A is n8k32, B is m16k32 */                  \
-    static_assert(WARP_N > 0 && WARP_N % 16 == 0);                                                                     \
-    static_assert(LOOP_K == 128);                                                                                      \
-    constexpr int WARP_COUNT = BLOCK_M / WARP_M * BLOCK_N / WARP_N;                                                    \
-    static_assert(0 < WARP_COUNT && WARP_COUNT <= 8 && (WARP_COUNT & (WARP_COUNT - 1)) == 0);                          \
-    if (!(M % BLOCK_M == 0 && N % BLOCK_N == 0 && K % LOOP_K == 0)) {                                                  \
-      throw std::runtime_error("M or N or K are not aligned.");                                                        \
-    }                                                                                                                  \
-    dim3 grid(N / BLOCK_N, M / BLOCK_M);                                                                               \
-    dim3 block(WARP_COUNT * 32);                                                                                       \
-    auto kSmemSize   = 0;                                                                                              \
-    auto kernel_func = &function<BLOCK_M, BLOCK_N, WARP_M, WARP_N, LOOP_K>;                                            \
-    CHECK_CUDA_RETURN(cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));      \
-    function<BLOCK_M, BLOCK_N, WARP_M, WARP_N, LOOP_K><<<grid, block, 0, stream>>>(                                    \
-      A, A_scale_transposed, B_transposed, B_scale_transposed, C, C_scale_transposed, M, N, K);                        \
+    constexpr int MxN_GROUP_PER_WARP = M_GROUP_PER_WARP * N_GROUP_PER_WARP;                                            \
+    static_assert(MxN_GROUP_PER_WARP <= 32);                                                                           \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 0);                               \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 1);                               \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 2);                               \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 3);                               \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 4);                               \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 5);                               \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 6);                               \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 7);                               \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 8);                               \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 9);                               \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 10);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 11);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 12);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 13);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 14);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 15);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 16);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 17);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 18);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 19);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 20);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 21);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 22);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 23);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 24);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 25);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 26);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 27);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 28);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 29);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 30);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 31);                              \
+    alternate__per_rank(ldg_switch, cal_switch, (ldg_k), (ldg_q_idx), (cal_reg_idx), 32);                              \
+  }
+
+  constexpr int IGN  = -1;
+  constexpr int IDX0 = 0, IDX1 = 1;
+
+  {
+    alternate(LDG_ON_S, CAL_OFF, 0, IGN, IGN);
+    alternate(LDG_ON_Q_A, CAL_OFF, 0, IDX0, IGN);
+    alternate(LDG_ON_Q_B, CAL_OFF, 0, IGN, IGN);
+    alternate(LDG_ON_S_POST, CAL_OFF, IGN, IGN, IGN);
+  }
+
+  int k_block_offset = 0;
+  static_assert(LOOP_K == 128);
+  while (k_block_offset + 128 < K) {
+    alternate(LDG_ON_S, CAL_OFF, k_block_offset + 128, IGN, IGN);
+    {
+      k_block_offset += 32;
+      alternate(LDG_ON_Q_A, CAL_OFF, k_block_offset, IDX1, IGN);
+      alternate(LDG_ON_Q_B, CAL_ON, k_block_offset, IGN, IDX0);
+    }
+    {
+      k_block_offset += 32;
+      alternate(LDG_ON_Q_A, CAL_OFF, k_block_offset, IDX0, IGN);
+      alternate(LDG_ON_Q_B, CAL_ON, k_block_offset, IGN, IDX1);
+    }
+    {
+      k_block_offset += 32;
+      alternate(LDG_ON_Q_A, CAL_OFF, k_block_offset, IDX1, IGN);
+      alternate(LDG_ON_Q_B, CAL_ON, k_block_offset, IGN, IDX0);
+    }
+    {
+      k_block_offset += 32;
+      alternate(LDG_ON_Q_A, CAL_OFF, k_block_offset, IDX0, IGN);
+      alternate(LDG_ON_Q_B, CAL_ON, k_block_offset, IGN, IDX1);
+    }
+    alternate(LDG_ON_S_POST, CAL_OFF, IGN, IGN, IGN);
+  }
+  {
+    {
+      k_block_offset += 32;
+      alternate(LDG_ON_Q_A, CAL_OFF, k_block_offset, IDX1, IGN);
+      alternate(LDG_ON_Q_B, CAL_ON, k_block_offset, IGN, IDX0);
+    }
+    {
+      k_block_offset += 32;
+      alternate(LDG_ON_Q_A, CAL_OFF, k_block_offset, IDX0, IGN);
+      alternate(LDG_ON_Q_B, CAL_ON, k_block_offset, IGN, IDX1);
+    }
+    {
+      k_block_offset += 32;
+      alternate(LDG_ON_Q_A, CAL_OFF, k_block_offset, IDX1, IGN);
+      alternate(LDG_ON_Q_B, CAL_ON, k_block_offset, IGN, IDX0);
+    }
+    {
+      alternate(LDG_OFF, CAL_ON, IGN, IGN, IDX1);
+    }
+  }
+
+  constexpr int m_lane_offset[8] = {0, 2, 4, 6, 1, 3, 5, 7};
+  float         max_val[M_GROUP_PER_WARP];
+  __shared__ float C_block_extrema[M_WARP_COUNT][WARP_M][N_WARP_COUNT];
+
+  for (int mg = 0; mg < M_GROUP_PER_WARP; ++mg) {
+    max_val[mg] = fabs(C_cal_reg[mg][0][0]);
+    for (int ng = 0; ng < N_GROUP_PER_WARP; ++ng) {
+      LLMMM::shfl_1_and_0(C_cal_reg[mg][ng], 0x4, lane_id);
+      LLMMM::shfl_3_and_2(C_cal_reg[mg][ng], 0x4, lane_id);
+      LLMMM::shfl_23_and_01(C_cal_reg[mg][ng], 0x8, lane_id);
+
+      constexpr int array_size = get_array_size(C_cal_reg[0][0]);
+      for (int i = 0; i < array_size; ++i) {
+        max_val[mg] = max_val[mg] > fabs(C_cal_reg[mg][ng][i]) ? max_val[mg] : fabs(C_cal_reg[mg][ng][i]);
+      }
+      max_val[mg] = max(max_val[mg], __shfl_xor_sync(0xffffffff, max_val[mg], 0x10));
+      max_val[mg] = max(max_val[mg], __shfl_xor_sync(0xffffffff, max_val[mg], 0x08));
+    }
+    if (lane_id < 8) {
+      const int m = mg * 8 + m_lane_offset[lane_id];
+      STORE_FLOAT(C_block_extrema[m_warp_id][m][n_warp_id], max_val[mg]);
+    }
+  }
+
+  __syncthreads();
+
+  for (int mg = 0; mg < M_GROUP_PER_WARP; ++mg) {
+    const int m = mg * 8 + m_lane_offset[lane_id % 8];
+    for (int nw = 0; nw < N_WARP_COUNT; ++nw) {
+      float max_val_sm;
+      FETCH_FLOAT(max_val_sm, C_block_extrema[m_warp_id][m][nw]);
+      max_val[mg] = max(max_val[mg], max_val_sm);
+    }
+  }
+
+  constexpr float fp8_e4m3_range = 448;
+
+  for (int mg = 0; mg < M_GROUP_PER_WARP; ++mg) {
+    const float scale_inv = fp8_e4m3_range / max_val[mg];
+    const float scale     = max_val[mg] / fp8_e4m3_range;
+    const int   m_global  = m_block_offset + m_warp_offset + mg * 8 + m_lane_offset[lane_id % 8];
+    static_assert(N_GROUP_PER_WARP % 2 == 0);
+    for (int ng = 0; ng < N_GROUP_PER_WARP; ng += 2) {
+      const int n_global = n_block_offset + n_warp_offset + ng * 16 + lane_id / 8 * 8;
+      fp8_t     q[8]     = {
+        fp8_t(C_cal_reg[mg][ng][0] * scale_inv),
+        fp8_t(C_cal_reg[mg][ng][1] * scale_inv),
+        fp8_t(C_cal_reg[mg][ng][2] * scale_inv),
+        fp8_t(C_cal_reg[mg][ng][3] * scale_inv),
+        fp8_t(C_cal_reg[mg][ng + 1][0] * scale_inv),
+        fp8_t(C_cal_reg[mg][ng + 1][1] * scale_inv),
+        fp8_t(C_cal_reg[mg][ng + 1][2] * scale_inv),
+        fp8_t(C_cal_reg[mg][ng + 1][3] * scale_inv),
+      };
+      LLMMM::shfl_4567_and_0123(q, 0x10, lane_id);
+      STORE_FLOAT2(C[OFFSET(m_global, n_global, N)], q);
+    }
+    if (lane_id < 8) {
+      static_assert(BLOCK_N <= 128);
+      STORE_FLOAT(C_scale_transposed[OFFSET(n_block_offset / 128, m_global, M)], scale);
+    }
+  }
+#undef alternate
+#undef alternate__per_rank
+}
+
+#define launch_128x128_64x64(function)                                                                                                \
+  void function(const __nv_fp8_e4m3* A,                                                                                               \
+                const float*         A_scale_transposed,                                                                              \
+                const __nv_fp8_e4m3* B_transposed,                                                                                    \
+                const float*         B_scale_transposed,                                                                              \
+                __nv_fp8_e4m3*       C,                                                                                               \
+                float*               C_scale_transposed,                                                                              \
+                int                  M,                                                                                               \
+                int                  N,                                                                                               \
+                int                  K,                                                                                               \
+                cudaStream_t         stream)                                                                                          \
+  {                                                                                                                                   \
+    constexpr int BLOCK_M = 128;                                                                                                      \
+    constexpr int BLOCK_N = 128;                                                                                                      \
+    constexpr int LOOP_K  = 128;                                                                                                      \
+    constexpr int WARP_M  = 64;                                                                                                       \
+    constexpr int WARP_N  = 64;                                                                                                       \
+    static_assert(BLOCK_M > 0 && BLOCK_M <= 128 && BLOCK_M % WARP_M == 0);                                                            \
+    static_assert(BLOCK_N == 128 && BLOCK_N % WARP_N == 0);                                                                           \
+    static_assert(WARP_M > 0 && WARP_M % 8 == 0); /* mma.m16n8k32.row.col, A is n8k32, B is m16k32 */                                 \
+    static_assert(WARP_N > 0 && WARP_N % 16 == 0);                                                                                    \
+    static_assert(LOOP_K == 128);                                                                                                     \
+    constexpr int WARP_COUNT = BLOCK_M / WARP_M * BLOCK_N / WARP_N;                                                                   \
+    static_assert(0 < WARP_COUNT && WARP_COUNT <= 8 && (WARP_COUNT & (WARP_COUNT - 1)) == 0);                                         \
+    if (!(M % BLOCK_M == 0 && N % BLOCK_N == 0 && K % LOOP_K == 0)) {                                                                 \
+      throw std::runtime_error("M or N or K are not aligned.");                                                                       \
+    }                                                                                                                                 \
+    dim3 grid(N / BLOCK_N, M / BLOCK_M);                                                                                              \
+    dim3 block(WARP_COUNT * 32);                                                                                                      \
+    int  sm_size = 0;                                                                                                                 \
+    if (                                                                                                                              \
+      #function                                                                                                                       \
+      != std::string(                                                                                                                 \
+        "fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8__quadra_buffer__no_sm__B_Q_single_buffer__memcpy_async")) { \
+      sm_size = 0;                                                                                                                    \
+    }                                                                                                                                 \
+    function<BLOCK_M, BLOCK_N, WARP_M, WARP_N, LOOP_K><<<grid, block, sm_size, stream>>>(                                             \
+      A, A_scale_transposed, B_transposed, B_scale_transposed, C, C_scale_transposed, M, N, K);                                       \
   }
 
 launch_128x128_64x64(fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8__quadra_buffer__no_sm);
 launch_128x128_64x64(
   fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8__quadra_buffer__no_sm__B_Q_single_buffer);
+launch_128x128_64x64(
+  fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8__quadra_buffer__no_sm__B_Q_single_buffer__memcpy_async);
 
 #undef launch_128x128_64x64
 
@@ -1114,6 +1418,8 @@ int main()
 
   check(fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8__quadra_buffer__no_sm);
   check(fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8__quadra_buffer__no_sm__B_Q_single_buffer);
+  check(
+    fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8__quadra_buffer__no_sm__B_Q_single_buffer__memcpy_async);
 #undef check
 
   CHECK_CUDA_RETURN(cudaFree(d_A));
