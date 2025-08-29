@@ -203,9 +203,9 @@ __global__ void fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8
   const int n_warp_offset  = n_warp_id * WARP_N;
 
   // LDG
-  constexpr int    LDG_S_REG_BUFFER_SIZE = 2;
-  float            A_scale_reg[LDG_S_REG_BUFFER_SIZE][M_GROUP_PER_WARP][2];  // A_scale_transposed is (K/128) x M
-  float            B_scale_reg;                                              // B_scale_transposed is (N/128) x (K/128)
+  constexpr int LDG_S_REG_BUFFER_SIZE = 2;
+  float         A_scale_reg[LDG_S_REG_BUFFER_SIZE][M_GROUP_PER_WARP][2];  // A_scale_transposed is (K/128) x M
+  float         B_scale_reg;                                              // B_scale_transposed is (N/128) x (K/128)
 
   constexpr int CAL_BUFFER_SIZE = 2;
   // MMA
@@ -381,8 +381,8 @@ __global__ void fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8
     }
   }
 
-  constexpr int m_lane_offset[8] = {0, 2, 4, 6, 1, 3, 5, 7};
-  float         max_val[M_GROUP_PER_WARP];
+  constexpr int    m_lane_offset[8] = {0, 2, 4, 6, 1, 3, 5, 7};
+  float            max_val[M_GROUP_PER_WARP];
   __shared__ float C_block_extrema[M_WARP_COUNT][WARP_M][N_WARP_COUNT];
 
   for (int mg = 0; mg < M_GROUP_PER_WARP; ++mg) {
@@ -477,9 +477,9 @@ fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8__quadra_buffer_
   const int n_warp_offset  = n_warp_id * WARP_N;
 
   // LDG
-  constexpr int    LDG_S_REG_BUFFER_SIZE = 2;
-  float            A_scale_reg[LDG_S_REG_BUFFER_SIZE][M_GROUP_PER_WARP][2];  // A_scale_transposed is (K/128) x M
-  float            B_scale_reg;                                              // B_scale_transposed is (N/128) x (K/128)
+  constexpr int LDG_S_REG_BUFFER_SIZE = 2;
+  float         A_scale_reg[LDG_S_REG_BUFFER_SIZE][M_GROUP_PER_WARP][2];  // A_scale_transposed is (K/128) x M
+  float         B_scale_reg;                                              // B_scale_transposed is (N/128) x (K/128)
 
   constexpr int CAL_BUFFER_SIZE = 2;
   // MMA
@@ -525,55 +525,55 @@ fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8__quadra_buffer_
   const float* A_scale_partial_ptr[M_GROUP_PER_WARP];
   for (int mg = 0; mg < M_GROUP_PER_WARP; ++mg) {
     A_scale_partial_ptr[mg] = &A_scale_transposed[m_block_offset + m_warp_offset + mg * 8 + lane_id % 4 * 2];
-}
+  }
 
 #define alternate__per_rank(ldg_switch, cal_switch, ldg_k, ldg_q_idx, cal_reg_idx, rank)                               \
-{                                                                                                                      \
-  if constexpr (cal_switch && rank > 0 && rank <= MxN_GROUP_PER_WARP) {                                                \
-    constexpr int mg = (rank - 1) % M_GROUP_PER_WARP;                                                                  \
-    constexpr int ng = (rank - 1) / M_GROUP_PER_WARP;                                                                  \
-    C_cal_reg[mg][ng][0] += C_mma_reg[mg][ng][0] * A_scale_reg[0][mg][0];                                              \
-    C_cal_reg[mg][ng][1] += C_mma_reg[mg][ng][1] * A_scale_reg[0][mg][1];                                              \
-    C_cal_reg[mg][ng][2] += C_mma_reg[mg][ng][2] * A_scale_reg[0][mg][0];                                              \
-    C_cal_reg[mg][ng][3] += C_mma_reg[mg][ng][3] * A_scale_reg[0][mg][1];                                              \
-  }                                                                                                                    \
-  if constexpr (cal_switch && rank < MxN_GROUP_PER_WARP) {                                                             \
-    constexpr int mg = rank % M_GROUP_PER_WARP;                                                                        \
-    constexpr int ng = rank / M_GROUP_PER_WARP;                                                                        \
-    mma_m16n8k32_row_col(C_mma_reg[mg][ng], B_cal_reg[ng].mma, A_cal_reg[cal_reg_idx][mg].mma, ZERO_ARR);              \
-  }                                                                                                                    \
-  if constexpr (ldg_switch == LDG_ON_Q_A && rank < M_GROUP_PER_WARP) {                                                 \
-    constexpr int m_group = rank;                                                                                      \
-    /* constexpr int m_group_offset = m_group * 8;                                                      */             \
-    /* const int     m_lane_offset  = lane_id / 4;                                                      */             \
-    /* const int     k_lane_offset  = lane_id % 4 * 8;                                                  */             \
-    /* const int     m_global       = m_block_offset + m_warp_offset + m_group_offset + m_lane_offset;  */             \
-    /* const int     k_global       = k_lane_offset + ldg_k;                                            */             \
-    FETCH_FLOAT2_WITH_SRC_PTR(A_cal_reg[ldg_q_idx][m_group].ldg, A_partial_ptr[m_group] + ldg_k);                      \
-  }                                                                                                                    \
-  if constexpr (ldg_switch == LDG_ON_Q_B && rank <= MxN_GROUP_PER_WARP && rank % M_GROUP_PER_WARP == 0                 \
-                && rank / M_GROUP_PER_WARP > 0) {                                                                      \
-    constexpr int n_group = rank / M_GROUP_PER_WARP - 1;                                                               \
-    /* constexpr int n_group_offset = n_group * 16;                                                       */           \
-    /* const int     n_lane_offset  = lane_id / 4 + (lane_id & 0x1) * 8;                                  */           \
-    /* const int     k_lane_offset  = lane_id % 4 / 2 * 16;                                               */           \
-    /* const int     n_global       = n_block_offset + n_warp_offset + n_group_offset + n_lane_offset;    */           \
-    /* const int     k_global       = k_lane_offset + ldg_k;                                              */           \
-    FETCH_FLOAT4_WITH_SRC_PTR(B_cal_reg[n_group].ldg, B_parital_ptr[n_group] + ldg_k);                                 \
-  }                                                                                                                    \
-  if constexpr (ldg_switch == LDG_ON_S && rank == 0) {                                                                 \
-    FETCH_FLOAT(B_scale_reg, *(B_scale_partial_ptr + ldg_k / 128));                                                    \
-  }                                                                                                                    \
-  if constexpr (ldg_switch == LDG_ON_S && rank < M_GROUP_PER_WARP) {                                                   \
-    constexpr int mg = rank;                                                                                           \
-    FETCH_FLOAT2_WITH_SRC_PTR(A_scale_reg[1][mg], A_scale_partial_ptr[mg] + ldg_k / 128 * M);                          \
-  }                                                                                                                    \
-  if constexpr (ldg_switch == LDG_ON_S_POST && rank < M_GROUP_PER_WARP) {                                              \
-    constexpr int mg      = rank;                                                                                      \
-    A_scale_reg[0][mg][0] = A_scale_reg[1][mg][0] * B_scale_reg;                                                       \
-    A_scale_reg[0][mg][1] = A_scale_reg[1][mg][1] * B_scale_reg;                                                       \
-  }                                                                                                                    \
-}
+  {                                                                                                                    \
+    if constexpr (cal_switch && rank > 0 && rank <= MxN_GROUP_PER_WARP) {                                              \
+      constexpr int mg = (rank - 1) % M_GROUP_PER_WARP;                                                                \
+      constexpr int ng = (rank - 1) / M_GROUP_PER_WARP;                                                                \
+      C_cal_reg[mg][ng][0] += C_mma_reg[mg][ng][0] * A_scale_reg[0][mg][0];                                            \
+      C_cal_reg[mg][ng][1] += C_mma_reg[mg][ng][1] * A_scale_reg[0][mg][1];                                            \
+      C_cal_reg[mg][ng][2] += C_mma_reg[mg][ng][2] * A_scale_reg[0][mg][0];                                            \
+      C_cal_reg[mg][ng][3] += C_mma_reg[mg][ng][3] * A_scale_reg[0][mg][1];                                            \
+    }                                                                                                                  \
+    if constexpr (cal_switch && rank < MxN_GROUP_PER_WARP) {                                                           \
+      constexpr int mg = rank % M_GROUP_PER_WARP;                                                                      \
+      constexpr int ng = rank / M_GROUP_PER_WARP;                                                                      \
+      mma_m16n8k32_row_col(C_mma_reg[mg][ng], B_cal_reg[ng].mma, A_cal_reg[cal_reg_idx][mg].mma, ZERO_ARR);            \
+    }                                                                                                                  \
+    if constexpr (ldg_switch == LDG_ON_Q_A && rank < M_GROUP_PER_WARP) {                                               \
+      constexpr int m_group = rank;                                                                                    \
+      /* constexpr int m_group_offset = m_group * 8;                                                      */           \
+      /* const int     m_lane_offset  = lane_id / 4;                                                      */           \
+      /* const int     k_lane_offset  = lane_id % 4 * 8;                                                  */           \
+      /* const int     m_global       = m_block_offset + m_warp_offset + m_group_offset + m_lane_offset;  */           \
+      /* const int     k_global       = k_lane_offset + ldg_k;                                            */           \
+      FETCH_FLOAT2_WITH_SRC_PTR(A_cal_reg[ldg_q_idx][m_group].ldg, A_partial_ptr[m_group] + ldg_k);                    \
+    }                                                                                                                  \
+    if constexpr (ldg_switch == LDG_ON_Q_B && rank <= MxN_GROUP_PER_WARP && rank % M_GROUP_PER_WARP == 0               \
+                  && rank / M_GROUP_PER_WARP > 0) {                                                                    \
+      constexpr int n_group = rank / M_GROUP_PER_WARP - 1;                                                             \
+      /* constexpr int n_group_offset = n_group * 16;                                                       */         \
+      /* const int     n_lane_offset  = lane_id / 4 + (lane_id & 0x1) * 8;                                  */         \
+      /* const int     k_lane_offset  = lane_id % 4 / 2 * 16;                                               */         \
+      /* const int     n_global       = n_block_offset + n_warp_offset + n_group_offset + n_lane_offset;    */         \
+      /* const int     k_global       = k_lane_offset + ldg_k;                                              */         \
+      FETCH_FLOAT4_WITH_SRC_PTR(B_cal_reg[n_group].ldg, B_parital_ptr[n_group] + ldg_k);                               \
+    }                                                                                                                  \
+    if constexpr (ldg_switch == LDG_ON_S && rank == 0) {                                                               \
+      FETCH_FLOAT(B_scale_reg, *(B_scale_partial_ptr + ldg_k / 128));                                                  \
+    }                                                                                                                  \
+    if constexpr (ldg_switch == LDG_ON_S && rank < M_GROUP_PER_WARP) {                                                 \
+      constexpr int mg = rank;                                                                                         \
+      FETCH_FLOAT2_WITH_SRC_PTR(A_scale_reg[1][mg], A_scale_partial_ptr[mg] + ldg_k / 128 * M);                        \
+    }                                                                                                                  \
+    if constexpr (ldg_switch == LDG_ON_S_POST && rank < M_GROUP_PER_WARP) {                                            \
+      constexpr int mg      = rank;                                                                                    \
+      A_scale_reg[0][mg][0] = A_scale_reg[1][mg][0] * B_scale_reg;                                                     \
+      A_scale_reg[0][mg][1] = A_scale_reg[1][mg][1] * B_scale_reg;                                                     \
+    }                                                                                                                  \
+  }
 
 #define alternate(ldg_switch, cal_switch, ldg_k, ldg_q_idx, cal_reg_idx)                                               \
   {                                                                                                                    \
@@ -671,8 +671,8 @@ fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8__quadra_buffer_
     }
   }
 
-  constexpr int m_lane_offset[8] = {0, 2, 4, 6, 1, 3, 5, 7};
-  float         max_val[M_GROUP_PER_WARP];
+  constexpr int    m_lane_offset[8] = {0, 2, 4, 6, 1, 3, 5, 7};
+  float            max_val[M_GROUP_PER_WARP];
   __shared__ float C_block_extrema[M_WARP_COUNT][WARP_M][N_WARP_COUNT];
 
   for (int mg = 0; mg < M_GROUP_PER_WARP; ++mg) {
@@ -767,9 +767,9 @@ fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8__quadra_buffer_
   const int n_warp_offset  = n_warp_id * WARP_N;
 
   // LDG
-  constexpr int    LDG_S_REG_BUFFER_SIZE = 2;
-  float            A_scale_reg[LDG_S_REG_BUFFER_SIZE][M_GROUP_PER_WARP][2];  // A_scale_transposed is (K/128) x M
-  float            B_scale_reg;                                              // B_scale_transposed is (N/128) x (K/128)
+  constexpr int LDG_S_REG_BUFFER_SIZE = 2;
+  float         A_scale_reg[LDG_S_REG_BUFFER_SIZE][M_GROUP_PER_WARP][2];  // A_scale_transposed is (K/128) x M
+  float         B_scale_reg;                                              // B_scale_transposed is (N/128) x (K/128)
 
   constexpr int CAL_BUFFER_SIZE = 2;
   // MMA
@@ -817,60 +817,60 @@ fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8__quadra_buffer_
   const float* A_scale_partial_ptr[M_GROUP_PER_WARP];
   for (int mg = 0; mg < M_GROUP_PER_WARP; ++mg) {
     A_scale_partial_ptr[mg] = &A_scale_transposed[m_block_offset + m_warp_offset + mg * 8 + lane_id % 4 * 2];
-}
+  }
 
 #define alternate__per_rank(ldg_switch, cal_switch, ldg_k, ldg_q_idx, cal_reg_idx, rank)                               \
-{                                                                                                                      \
-  if constexpr (cal_switch == CAL_ON_LAST && rank > 0 && rank <= MxN_GROUP_PER_WARP) {                                 \
-    constexpr int mg = (rank - 1) % M_GROUP_PER_WARP;                                                                  \
-    constexpr int ng = (rank - 1) / M_GROUP_PER_WARP;                                                                  \
-    C_cal_reg[mg][ng][0] += C_mma_reg[mg][ng][0] * A_scale_reg[0][mg][0];                                              \
-    C_cal_reg[mg][ng][1] += C_mma_reg[mg][ng][1] * A_scale_reg[0][mg][1];                                              \
-    C_cal_reg[mg][ng][2] += C_mma_reg[mg][ng][2] * A_scale_reg[0][mg][0];                                              \
-    C_cal_reg[mg][ng][3] += C_mma_reg[mg][ng][3] * A_scale_reg[0][mg][1];                                              \
-  }                                                                                                                    \
-  if constexpr (cal_switch == CAL_ON_FIRST && rank < MxN_GROUP_PER_WARP) {                                             \
-    constexpr int mg = rank % M_GROUP_PER_WARP;                                                                        \
-    constexpr int ng = rank / M_GROUP_PER_WARP;                                                                        \
-    mma_m16n8k32_row_col(C_mma_reg[mg][ng], B_cal_reg[ng].mma, A_cal_reg[cal_reg_idx][mg].mma, ZERO_ARR);              \
-  }                                                                                                                    \
-  if constexpr ((cal_switch == CAL_ON_MIDDLE || cal_switch == CAL_ON_LAST) && rank < MxN_GROUP_PER_WARP) {             \
-    constexpr int mg = rank % M_GROUP_PER_WARP;                                                                        \
-    constexpr int ng = rank / M_GROUP_PER_WARP;                                                                        \
-    mma_m16n8k32_row_col(C_mma_reg[mg][ng], B_cal_reg[ng].mma, A_cal_reg[cal_reg_idx][mg].mma, C_mma_reg[mg][ng]);     \
-  }                                                                                                                    \
-  if constexpr (ldg_switch == LDG_ON_Q_A && rank < M_GROUP_PER_WARP) {                                                 \
-    constexpr int m_group = rank;                                                                                      \
-    /* constexpr int m_group_offset = m_group * 8;                                                      */             \
-    /* const int     m_lane_offset  = lane_id / 4;                                                      */             \
-    /* const int     k_lane_offset  = lane_id % 4 * 8;                                                  */             \
-    /* const int     m_global       = m_block_offset + m_warp_offset + m_group_offset + m_lane_offset;  */             \
-    /* const int     k_global       = k_lane_offset + ldg_k;                                            */             \
-    FETCH_FLOAT2_WITH_SRC_PTR(A_cal_reg[ldg_q_idx][m_group].ldg, A_partial_ptr[m_group] + ldg_k);                      \
-  }                                                                                                                    \
-  if constexpr (ldg_switch == LDG_ON_Q_B && rank <= MxN_GROUP_PER_WARP && rank % M_GROUP_PER_WARP == 0                 \
-                && rank / M_GROUP_PER_WARP > 0) {                                                                      \
-    constexpr int n_group = rank / M_GROUP_PER_WARP - 1;                                                               \
-    /* constexpr int n_group_offset = n_group * 16;                                                       */           \
-    /* const int     n_lane_offset  = lane_id / 4 + (lane_id & 0x1) * 8;                                  */           \
-    /* const int     k_lane_offset  = lane_id % 4 / 2 * 16;                                               */           \
-    /* const int     n_global       = n_block_offset + n_warp_offset + n_group_offset + n_lane_offset;    */           \
-    /* const int     k_global       = k_lane_offset + ldg_k;                                              */           \
-    FETCH_FLOAT4_WITH_SRC_PTR(B_cal_reg[n_group].ldg, B_parital_ptr[n_group] + ldg_k);                                 \
-  }                                                                                                                    \
-  if constexpr (ldg_switch == LDG_ON_S && rank == 0) {                                                                 \
-    FETCH_FLOAT(B_scale_reg, *(B_scale_partial_ptr + ldg_k / 128));                                                    \
-  }                                                                                                                    \
-  if constexpr (ldg_switch == LDG_ON_S && rank < M_GROUP_PER_WARP) {                                                   \
-    constexpr int mg = rank;                                                                                           \
-    FETCH_FLOAT2_WITH_SRC_PTR(A_scale_reg[1][mg], A_scale_partial_ptr[mg] + ldg_k / 128 * M);                          \
-  }                                                                                                                    \
-  if constexpr (ldg_switch == LDG_ON_S_POST && rank < M_GROUP_PER_WARP) {                                              \
-    constexpr int mg      = rank;                                                                                      \
-    A_scale_reg[0][mg][0] = A_scale_reg[1][mg][0] * B_scale_reg;                                                       \
-    A_scale_reg[0][mg][1] = A_scale_reg[1][mg][1] * B_scale_reg;                                                       \
-  }                                                                                                                    \
-}
+  {                                                                                                                    \
+    if constexpr (cal_switch == CAL_ON_LAST && rank > 0 && rank <= MxN_GROUP_PER_WARP) {                               \
+      constexpr int mg = (rank - 1) % M_GROUP_PER_WARP;                                                                \
+      constexpr int ng = (rank - 1) / M_GROUP_PER_WARP;                                                                \
+      C_cal_reg[mg][ng][0] += C_mma_reg[mg][ng][0] * A_scale_reg[0][mg][0];                                            \
+      C_cal_reg[mg][ng][1] += C_mma_reg[mg][ng][1] * A_scale_reg[0][mg][1];                                            \
+      C_cal_reg[mg][ng][2] += C_mma_reg[mg][ng][2] * A_scale_reg[0][mg][0];                                            \
+      C_cal_reg[mg][ng][3] += C_mma_reg[mg][ng][3] * A_scale_reg[0][mg][1];                                            \
+    }                                                                                                                  \
+    if constexpr (cal_switch == CAL_ON_FIRST && rank < MxN_GROUP_PER_WARP) {                                           \
+      constexpr int mg = rank % M_GROUP_PER_WARP;                                                                      \
+      constexpr int ng = rank / M_GROUP_PER_WARP;                                                                      \
+      mma_m16n8k32_row_col(C_mma_reg[mg][ng], B_cal_reg[ng].mma, A_cal_reg[cal_reg_idx][mg].mma, ZERO_ARR);            \
+    }                                                                                                                  \
+    if constexpr ((cal_switch == CAL_ON_MIDDLE || cal_switch == CAL_ON_LAST) && rank < MxN_GROUP_PER_WARP) {           \
+      constexpr int mg = rank % M_GROUP_PER_WARP;                                                                      \
+      constexpr int ng = rank / M_GROUP_PER_WARP;                                                                      \
+      mma_m16n8k32_row_col(C_mma_reg[mg][ng], B_cal_reg[ng].mma, A_cal_reg[cal_reg_idx][mg].mma, C_mma_reg[mg][ng]);   \
+    }                                                                                                                  \
+    if constexpr (ldg_switch == LDG_ON_Q_A && rank < M_GROUP_PER_WARP) {                                               \
+      constexpr int m_group = rank;                                                                                    \
+      /* constexpr int m_group_offset = m_group * 8;                                                      */           \
+      /* const int     m_lane_offset  = lane_id / 4;                                                      */           \
+      /* const int     k_lane_offset  = lane_id % 4 * 8;                                                  */           \
+      /* const int     m_global       = m_block_offset + m_warp_offset + m_group_offset + m_lane_offset;  */           \
+      /* const int     k_global       = k_lane_offset + ldg_k;                                            */           \
+      FETCH_FLOAT2_WITH_SRC_PTR(A_cal_reg[ldg_q_idx][m_group].ldg, A_partial_ptr[m_group] + ldg_k);                    \
+    }                                                                                                                  \
+    if constexpr (ldg_switch == LDG_ON_Q_B && rank <= MxN_GROUP_PER_WARP && rank % M_GROUP_PER_WARP == 0               \
+                  && rank / M_GROUP_PER_WARP > 0) {                                                                    \
+      constexpr int n_group = rank / M_GROUP_PER_WARP - 1;                                                             \
+      /* constexpr int n_group_offset = n_group * 16;                                                       */         \
+      /* const int     n_lane_offset  = lane_id / 4 + (lane_id & 0x1) * 8;                                  */         \
+      /* const int     k_lane_offset  = lane_id % 4 / 2 * 16;                                               */         \
+      /* const int     n_global       = n_block_offset + n_warp_offset + n_group_offset + n_lane_offset;    */         \
+      /* const int     k_global       = k_lane_offset + ldg_k;                                              */         \
+      FETCH_FLOAT4_WITH_SRC_PTR(B_cal_reg[n_group].ldg, B_parital_ptr[n_group] + ldg_k);                               \
+    }                                                                                                                  \
+    if constexpr (ldg_switch == LDG_ON_S && rank == 0) {                                                               \
+      FETCH_FLOAT(B_scale_reg, *(B_scale_partial_ptr + ldg_k / 128));                                                  \
+    }                                                                                                                  \
+    if constexpr (ldg_switch == LDG_ON_S && rank < M_GROUP_PER_WARP) {                                                 \
+      constexpr int mg = rank;                                                                                         \
+      FETCH_FLOAT2_WITH_SRC_PTR(A_scale_reg[1][mg], A_scale_partial_ptr[mg] + ldg_k / 128 * M);                        \
+    }                                                                                                                  \
+    if constexpr (ldg_switch == LDG_ON_S_POST && rank < M_GROUP_PER_WARP) {                                            \
+      constexpr int mg      = rank;                                                                                    \
+      A_scale_reg[0][mg][0] = A_scale_reg[1][mg][0] * B_scale_reg;                                                     \
+      A_scale_reg[0][mg][1] = A_scale_reg[1][mg][1] * B_scale_reg;                                                     \
+    }                                                                                                                  \
+  }
 
 #define alternate(ldg_switch, cal_switch, ldg_k, ldg_q_idx, cal_reg_idx)                                               \
   {                                                                                                                    \
@@ -968,8 +968,8 @@ fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8__quadra_buffer_
     }
   }
 
-  constexpr int m_lane_offset[8] = {0, 2, 4, 6, 1, 3, 5, 7};
-  float         max_val[M_GROUP_PER_WARP];
+  constexpr int    m_lane_offset[8] = {0, 2, 4, 6, 1, 3, 5, 7};
+  float            max_val[M_GROUP_PER_WARP];
   __shared__ float C_block_extrema[M_WARP_COUNT][WARP_M][N_WARP_COUNT];
 
   for (int mg = 0; mg < M_GROUP_PER_WARP; ++mg) {
@@ -1065,9 +1065,9 @@ fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8__quadra_buffer_
   const int n_warp_offset  = n_warp_id * WARP_N;
 
   // LDG
-  float            A_scale_reg[2][2];                                           // A_scale_transposed is (K/128) x M
-  float            B_scale_reg[2];                                              // B_scale_transposed is (N/128) x (K/128)
-  constexpr int LANE_COUNT = 32;
+  float            A_scale_reg[2][2];  // A_scale_transposed is (K/128) x M
+  float            B_scale_reg[2];     // B_scale_transposed is (N/128) x (K/128)
+  constexpr int    LANE_COUNT = 32;
   __shared__ float A_scale_sm[2][M_GROUP_PER_WARP][WARP_COUNT][LANE_COUNT][2];
 
   constexpr int CAL_BUFFER_SIZE = 2;
@@ -1114,64 +1114,64 @@ fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8__quadra_buffer_
   const float* A_scale_partial_ptr[M_GROUP_PER_WARP];
   for (int mg = 0; mg < M_GROUP_PER_WARP; ++mg) {
     A_scale_partial_ptr[mg] = &A_scale_transposed[m_block_offset + m_warp_offset + mg * 8 + lane_id % 4 * 2];
-}
+  }
 
 #define alternate__per_rank(ldg_switch, cal_switch, ldg_k, ldg_q_idx, cal_reg_idx, rank)                               \
-{                                                                                                                      \
-  if constexpr (cal_switch && rank > 0 && rank <= MxN_GROUP_PER_WARP) {                                                \
-    constexpr int mg  = (rank - 1) % M_GROUP_PER_WARP;                                                                 \
-    constexpr int ng  = (rank - 1) / M_GROUP_PER_WARP;                                                                 \
-    constexpr int idx = mg % 2;                                                                                        \
-    C_cal_reg[mg][ng][0] += C_mma_reg[mg][ng][0] * A_scale_reg[idx][0] * B_scale_reg[0];                                \
-    C_cal_reg[mg][ng][1] += C_mma_reg[mg][ng][1] * A_scale_reg[idx][1] * B_scale_reg[0];                                \
-    C_cal_reg[mg][ng][2] += C_mma_reg[mg][ng][2] * A_scale_reg[idx][0] * B_scale_reg[0];                                \
-    C_cal_reg[mg][ng][3] += C_mma_reg[mg][ng][3] * A_scale_reg[idx][1] * B_scale_reg[0];                                \
-  }                                                                                                                    \
-  if constexpr (cal_switch && rank < MxN_GROUP_PER_WARP) {                                                             \
-    constexpr int mg  = rank % M_GROUP_PER_WARP;                                                                       \
-    constexpr int ng  = rank / M_GROUP_PER_WARP;                                                                       \
-    constexpr int idx = mg % 2;                                                                                        \
-    FETCH_FLOAT2(A_scale_reg[idx][0], A_scale_sm[cal_s_idx][mg][warp_id][lane_id][0]);                                 \
-    mma_m16n8k32_row_col(C_mma_reg[mg][ng], B_cal_reg[ng].mma, A_cal_reg[cal_reg_idx][mg].mma, ZERO_ARR);              \
-  }                                                                                                                    \
-  if constexpr (ldg_switch == LDG_ON_Q_A && rank < M_GROUP_PER_WARP) {                                                 \
-    constexpr int m_group = rank;                                                                                      \
-    /* constexpr int m_group_offset = m_group * 8;                                                      */             \
-    /* const int     m_lane_offset  = lane_id / 4;                                                      */             \
-    /* const int     k_lane_offset  = lane_id % 4 * 8;                                                  */             \
-    /* const int     m_global       = m_block_offset + m_warp_offset + m_group_offset + m_lane_offset;  */             \
-    /* const int     k_global       = k_lane_offset + ldg_k;                                            */             \
-    FETCH_FLOAT2_WITH_SRC_PTR(A_cal_reg[ldg_q_idx][m_group].ldg, A_partial_ptr[m_group] + ldg_k);                      \
-  }                                                                                                                    \
-  if constexpr (ldg_switch == LDG_ON_Q_B && rank <= MxN_GROUP_PER_WARP && rank % M_GROUP_PER_WARP == 0                 \
-                && rank / M_GROUP_PER_WARP > 0) {                                                                      \
-    constexpr int n_group = rank / M_GROUP_PER_WARP - 1;                                                               \
-    /* constexpr int n_group_offset = n_group * 16;                                                       */           \
-    /* const int     n_lane_offset  = lane_id / 4 + (lane_id & 0x1) * 8;                                  */           \
-    /* const int     k_lane_offset  = lane_id % 4 / 2 * 16;                                               */           \
-    /* const int     n_global       = n_block_offset + n_warp_offset + n_group_offset + n_lane_offset;    */           \
-    /* const int     k_global       = k_lane_offset + ldg_k;                                              */           \
-    FETCH_FLOAT4_WITH_SRC_PTR(B_cal_reg[n_group].ldg, B_parital_ptr[n_group] + ldg_k);                                 \
-  }                                                                                                                    \
-  if constexpr (ldg_switch == LDG_ON_S && rank == 0) {                                                                 \
-    FETCH_FLOAT(B_scale_reg[1], *(B_scale_partial_ptr + ldg_k / 128));                                                 \
-  }                                                                                                                    \
-  if constexpr (ldg_switch == LDG_ON_S && rank < M_GROUP_PER_WARP) {                                                   \
-    constexpr int mg = rank;                                                                                           \
-    /* FETCH_FLOAT2_WITH_SRC_PTR(A_scale_reg[1][mg], A_scale_partial_ptr[mg] + ldg_k / 128 * M); */                    \
-    __pipeline_memcpy_async(&A_scale_sm[ldg_s_idx][mg][warp_id][lane_id][0],                                           \
-                            A_scale_partial_ptr[mg] + ldg_k / 128 * M,                                                 \
-                            sizeof(float) * 2,                                                                         \
-                            0);                                                                                        \
-    __pipeline_commit();                                                                                               \
-  }                                                                                                                    \
-  if constexpr (ldg_switch == LDG_ON_S_POST && rank < M_GROUP_PER_WARP) {                                              \
-    if constexpr (rank == 0) {                                                                                         \
-      __pipeline_wait_prior(0);                                                                                        \
-      B_scale_reg[0] = B_scale_reg[1];                                                                                 \
+  {                                                                                                                    \
+    if constexpr (cal_switch && rank > 0 && rank <= MxN_GROUP_PER_WARP) {                                              \
+      constexpr int mg  = (rank - 1) % M_GROUP_PER_WARP;                                                               \
+      constexpr int ng  = (rank - 1) / M_GROUP_PER_WARP;                                                               \
+      constexpr int idx = mg % 2;                                                                                      \
+      C_cal_reg[mg][ng][0] += C_mma_reg[mg][ng][0] * A_scale_reg[idx][0] * B_scale_reg[0];                             \
+      C_cal_reg[mg][ng][1] += C_mma_reg[mg][ng][1] * A_scale_reg[idx][1] * B_scale_reg[0];                             \
+      C_cal_reg[mg][ng][2] += C_mma_reg[mg][ng][2] * A_scale_reg[idx][0] * B_scale_reg[0];                             \
+      C_cal_reg[mg][ng][3] += C_mma_reg[mg][ng][3] * A_scale_reg[idx][1] * B_scale_reg[0];                             \
     }                                                                                                                  \
-  }                                                                                                                    \
-}
+    if constexpr (cal_switch && rank < MxN_GROUP_PER_WARP) {                                                           \
+      constexpr int mg  = rank % M_GROUP_PER_WARP;                                                                     \
+      constexpr int ng  = rank / M_GROUP_PER_WARP;                                                                     \
+      constexpr int idx = mg % 2;                                                                                      \
+      FETCH_FLOAT2(A_scale_reg[idx][0], A_scale_sm[cal_s_idx][mg][warp_id][lane_id][0]);                               \
+      mma_m16n8k32_row_col(C_mma_reg[mg][ng], B_cal_reg[ng].mma, A_cal_reg[cal_reg_idx][mg].mma, ZERO_ARR);            \
+    }                                                                                                                  \
+    if constexpr (ldg_switch == LDG_ON_Q_A && rank < M_GROUP_PER_WARP) {                                               \
+      constexpr int m_group = rank;                                                                                    \
+      /* constexpr int m_group_offset = m_group * 8;                                                      */           \
+      /* const int     m_lane_offset  = lane_id / 4;                                                      */           \
+      /* const int     k_lane_offset  = lane_id % 4 * 8;                                                  */           \
+      /* const int     m_global       = m_block_offset + m_warp_offset + m_group_offset + m_lane_offset;  */           \
+      /* const int     k_global       = k_lane_offset + ldg_k;                                            */           \
+      FETCH_FLOAT2_WITH_SRC_PTR(A_cal_reg[ldg_q_idx][m_group].ldg, A_partial_ptr[m_group] + ldg_k);                    \
+    }                                                                                                                  \
+    if constexpr (ldg_switch == LDG_ON_Q_B && rank <= MxN_GROUP_PER_WARP && rank % M_GROUP_PER_WARP == 0               \
+                  && rank / M_GROUP_PER_WARP > 0) {                                                                    \
+      constexpr int n_group = rank / M_GROUP_PER_WARP - 1;                                                             \
+      /* constexpr int n_group_offset = n_group * 16;                                                       */         \
+      /* const int     n_lane_offset  = lane_id / 4 + (lane_id & 0x1) * 8;                                  */         \
+      /* const int     k_lane_offset  = lane_id % 4 / 2 * 16;                                               */         \
+      /* const int     n_global       = n_block_offset + n_warp_offset + n_group_offset + n_lane_offset;    */         \
+      /* const int     k_global       = k_lane_offset + ldg_k;                                              */         \
+      FETCH_FLOAT4_WITH_SRC_PTR(B_cal_reg[n_group].ldg, B_parital_ptr[n_group] + ldg_k);                               \
+    }                                                                                                                  \
+    if constexpr (ldg_switch == LDG_ON_S && rank == 0) {                                                               \
+      FETCH_FLOAT(B_scale_reg[1], *(B_scale_partial_ptr + ldg_k / 128));                                               \
+    }                                                                                                                  \
+    if constexpr (ldg_switch == LDG_ON_S && rank < M_GROUP_PER_WARP) {                                                 \
+      constexpr int mg = rank;                                                                                         \
+      /* FETCH_FLOAT2_WITH_SRC_PTR(A_scale_reg[1][mg], A_scale_partial_ptr[mg] + ldg_k / 128 * M); */                  \
+      __pipeline_memcpy_async(&A_scale_sm[ldg_s_idx][mg][warp_id][lane_id][0],                                         \
+                              A_scale_partial_ptr[mg] + ldg_k / 128 * M,                                               \
+                              sizeof(float) * 2,                                                                       \
+                              0);                                                                                      \
+      __pipeline_commit();                                                                                             \
+    }                                                                                                                  \
+    if constexpr (ldg_switch == LDG_ON_S_POST && rank < M_GROUP_PER_WARP) {                                            \
+      if constexpr (rank == 0) {                                                                                       \
+        __pipeline_wait_prior(0);                                                                                      \
+        B_scale_reg[0] = B_scale_reg[1];                                                                               \
+      }                                                                                                                \
+    }                                                                                                                  \
+  }
 
 #define alternate(ldg_switch, cal_switch, ldg_k, ldg_q_idx, cal_reg_idx)                                               \
   {                                                                                                                    \
@@ -1275,8 +1275,8 @@ fp8_gemm_blockwise_quant_A_1x128__B_128x128__C_1x128__output_fp8__quadra_buffer_
     }
   }
 
-  constexpr int m_lane_offset[8] = {0, 2, 4, 6, 1, 3, 5, 7};
-  float         max_val[M_GROUP_PER_WARP];
+  constexpr int    m_lane_offset[8] = {0, 2, 4, 6, 1, 3, 5, 7};
+  float            max_val[M_GROUP_PER_WARP];
   __shared__ float C_block_extrema[M_WARP_COUNT][WARP_M][N_WARP_COUNT];
 
   for (int mg = 0; mg < M_GROUP_PER_WARP; ++mg) {
