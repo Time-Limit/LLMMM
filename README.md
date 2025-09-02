@@ -10,8 +10,8 @@
   * FP16
   * FP8 Blockwise Quant
 * Attention
-  * MHA/GQA
-  * FP16/FP8
+  * MHA/GQA/MLA
+  * FP16/FP8 blockwise quant
   * Tree Mask
 * 尝试将 RMSNorm、fp8 dynamic quant、SILU、ROPE等算子融合进 MM 或者 Attention
 * 补充 TopP/TopK，Embedding Lookup 等流程，跑通 Qwen3 4B 模型。
