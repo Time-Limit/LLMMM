@@ -1,5 +1,5 @@
-#include "fp16/mm.cuh"
-#include "fp16/mm.h"
+#include "mm/fp16/mm.cuh"
+#include "mm/fp16/mm.h"
 
 namespace LLMMM {
 

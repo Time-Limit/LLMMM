@@ -1,2 +1,2 @@
-add_subdirectory(fp16)
+add_subdirectory(mm)
 add_subdirectory(base)
